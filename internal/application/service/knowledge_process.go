@@ -1947,11 +1947,19 @@ func (s *knowledgeService) generateQuestionsWithContext(ctx context.Context,
 
 // ReparseKnowledge deletes existing document content and re-parses the knowledge asynchronously.
 // This method reuses the logic from UpdateManualKnowledge for resource cleanup and async parsing.
+// When reparseOptions is non-nil, it controls caching behavior (skipCache, etc.);
 func (s *knowledgeService) ReparseKnowledge(
 	ctx context.Context,
 	knowledgeID string,
 	processOverrides *types.KnowledgeProcessOverrides,
+	reparseOptions *types.ReparseOptions,
 ) (*types.Knowledge, error) {
+	// Log cache-related options for observability
+	if reparseOptions != nil {
+		logger.Infof(ctx, "[Reparse] Cache options: skipCache=%v, skipVLMCache=%v, skipEmbeddingCache=%v, skipWikiMapCache=%v",
+			reparseOptions.SkipCache, reparseOptions.SkipVLMCache,
+			reparseOptions.SkipEmbeddingCache, reparseOptions.SkipWikiMapCache)
+	}
 	logger.Info(ctx, "Start re-parsing knowledge")
 
 	tenantID := ctx.Value(types.TenantIDContextKey).(uint64)

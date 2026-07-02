@@ -492,18 +492,42 @@ func (c *Client) UpdateKnowledge(ctx context.Context, knowledge *Knowledge) erro
 //
 // Example:
 //
+// ReparseOptions defines options for reparse operations.
+type ReparseOptions struct {
+	// SkipCache forces a full recompute, ignoring all cached results.
+	SkipCache bool `json:"skip_cache"`
+	// SkipVLMCache skips VLM result caching for this operation.
+	SkipVLMCache bool `json:"skip_vlm_cache"`
+	// SkipEmbeddingCache skips embedding result caching for this operation.
+	SkipEmbeddingCache bool `json:"skip_embedding_cache"`
+	// SkipWikiMapCache skips Wiki map result caching for this operation.
+	SkipWikiMapCache bool `json:"skip_wiki_map_cache"`
+}
+
+// ReparseRequest represents a reparse request.
+type ReparseRequest struct {
+	ProcessConfig *KnowledgeProcessOverrides `json:"process_config,omitempty"`
+	ReparseOptions *ReparseOptions `json:"reparse_options,omitempty"`
+}
+
 //	knowledge, err := client.ReparseKnowledge(ctx, "knowledge-id-123")
 //	if err != nil {
 //	    log.Fatalf("Failed to reparse knowledge: %v", err)
 //	}
 //	fmt.Printf("Knowledge reparse task submitted, status: %s\n", knowledge.ParseStatus)
-func (c *Client) ReparseKnowledge(ctx context.Context, knowledgeID string) (*Knowledge, error) {
+// ReparseKnowledge re-parses a knowledge with optional caching control.
+// When reparseOptions is nil, default caching behavior is used.
+func (c *Client) ReparseKnowledge(ctx context.Context, knowledgeID string, reparseOptions *ReparseOptions) (*Knowledge, error) {
 	if knowledgeID == "" {
 		return nil, fmt.Errorf("knowledge ID cannot be empty")
 	}
 
 	path := fmt.Sprintf("/api/v1/knowledge/%s/reparse", knowledgeID)
-	resp, err := c.doRequest(ctx, http.MethodPost, path, nil, nil)
+	var reqBody interface{}
+	if reparseOptions != nil {
+		reqBody = &ReparseRequest{ReparseOptions: reparseOptions}
+	}
+	resp, err := c.doRequest(ctx, http.MethodPost, path, reqBody, nil)
 	if err != nil {
 		return nil, err
 	}

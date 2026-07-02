@@ -1610,12 +1610,14 @@ func (h *KnowledgeHandler) ReparseKnowledge(c *gin.Context) {
 		return
 	}
 
-	// Optional per-reparse parse config override. Empty body keeps the
-	// overrides stored at upload time.
+	// Optional per-reparse parse config override and reparse options.
+	// Empty body keeps the overrides stored at upload time.
 	var processOverrides *types.KnowledgeProcessOverrides
+	var reparseOptions *types.ReparseOptions
 	if c.Request.ContentLength != 0 {
 		var req struct {
 			ProcessConfig *types.KnowledgeProcessOverrides `json:"process_config"`
+			ReparseOptions *types.ReparseOptions `json:"reparse_options"`
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
 			logger.Error(ctx, "Failed to parse reparse request body", err)
@@ -1623,10 +1625,11 @@ func (h *KnowledgeHandler) ReparseKnowledge(c *gin.Context) {
 			return
 		}
 		processOverrides = req.ProcessConfig
+		reparseOptions = req.ReparseOptions
 	}
 
 	// Call service to reparse knowledge
-	knowledge, err := h.kgService.ReparseKnowledge(effCtx, id, processOverrides)
+	knowledge, err := h.kgService.ReparseKnowledge(effCtx, id, processOverrides, reparseOptions)
 	if err != nil {
 		if appErr, ok := errors.IsAppError(err); ok {
 			c.Error(appErr)

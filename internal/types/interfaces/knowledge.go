@@ -98,10 +98,13 @@ type KnowledgeService interface {
 	// ReparseKnowledge deletes existing document content and re-parses the knowledge asynchronously.
 	// When processOverrides is non-nil, it is validated and persisted to the knowledge metadata
 	// before re-parsing, letting callers adjust parse config on reparse; nil keeps stored overrides.
+	// When reparseOptions is non-nil, it controls caching behavior (skipCache, etc.);
+	// nil uses default caching behavior.
 	ReparseKnowledge(
 		ctx context.Context,
 		knowledgeID string,
 		processOverrides *types.KnowledgeProcessOverrides,
+		reparseOptions *types.ReparseOptions,
 	) (*types.Knowledge, error)
 	// CancelKnowledgeParse marks an in-progress parse as cancelled by the
 	// user. The knowledge row and any partially written chunks/index are
