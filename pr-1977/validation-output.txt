@@ -1,0 +1,22 @@
+﻿# PR #1977 validation evidence
+# Generated: 2026-07-12T18:33:03
+
+
+> git diff --check
+exit_code=0
+
+> go test ./internal/contentcache ./internal/models/embedding -count=1
+ok  	github.com/Tencent/WeKnora/internal/contentcache	0.718s
+ok  	github.com/Tencent/WeKnora/internal/models/embedding	5.428s
+
+exit_code=0
+
+> go test ./internal/application/repository -run 'TestHardDeleteChunks|TestListAllChunksByKnowledgeID' -count=1
+ok  	github.com/Tencent/WeKnora/internal/application/repository	3.442s
+
+exit_code=0
+
+> go test ./internal/application/service -run 'Test(PostprocessLLMCacheKey|ParseGeneratedQuestions|UpsertStableChunks|SanitizeOCRText|MaskImageURLs|GenerateWithTemplateMasksImageURLsBeforeLLM|SplitChunksIntoCitationBatches|MergeCitationsIntoItems|FormatExistingTaxonomyForPrompt)' -count=1
+ok  	github.com/Tencent/WeKnora/internal/application/service	5.195s
+
+exit_code=0
