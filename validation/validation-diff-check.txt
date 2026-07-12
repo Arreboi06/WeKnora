@@ -1,0 +1,2 @@
+﻿PS> git diff --check
+OK: no whitespace errors
