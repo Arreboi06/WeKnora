@@ -31,7 +31,7 @@ const createTableTpl = "CREATE TABLE IF NOT EXISTS %s (" + `
     INDEX idx_src      (source_id),
     INDEX idx_tag      (tag_id),
     INDEX idx_enabled  (is_enabled),
-    FULLTEXT INDEX idx_content_ft (content)
+    FULLTEXT INDEX idx_content_ft (content) WITH PARSER ngram
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;`
 
 // ensureTable 保证目标维度对应的表已经存在。
@@ -72,8 +72,8 @@ func (r *mysqlRepository) createTable(ctx context.Context, tableName string) err
 // listEmbeddingTables 返回当前 database 下所有 <prefix>_% 命名的表。
 func (r *mysqlRepository) listEmbeddingTables(ctx context.Context) ([]string, error) {
 	const q = `SELECT TABLE_NAME FROM information_schema.tables
-		WHERE TABLE_SCHEMA = ? AND TABLE_NAME LIKE ?`
-	likePattern := r.tablePrefix + "%"
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME LIKE ? ESCAPE '\\'`
+	likePattern := escapeLikePattern(r.tablePrefix) + "%"
 	rows, err := r.db.QueryContext(ctx, q, r.database, likePattern)
 	if err != nil {
 		return nil, err

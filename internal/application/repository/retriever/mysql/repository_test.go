@@ -12,9 +12,11 @@ import (
 
 func TestBuildVectorWhereClause(t *testing.T) {
 	params := types.RetrieveParams{
-		KnowledgeBaseIDs: []string{"kb1", "kb2"},
-		KnowledgeIDs:     []string{"k1"},
-		TagIDs:           []string{"tag1"},
+		KnowledgeBaseIDs:    []string{"kb1", "kb2"},
+		KnowledgeIDs:        []string{"k1"},
+		TagIDs:              []string{"tag1"},
+		ExcludeKnowledgeIDs: []string{"k2"},
+		ExcludeChunkIDs:     []string{"c1", "c2"},
 	}
 
 	where, args := buildVectorWhereClause(params).build()
@@ -22,14 +24,16 @@ func TestBuildVectorWhereClause(t *testing.T) {
 		"knowledge_base_id IN (?,?)",
 		"knowledge_id IN (?)",
 		"tag_id IN (?)",
+		"knowledge_id NOT IN (?)",
+		"chunk_id NOT IN (?,?)",
 		"is_enabled",
 	} {
 		if !strings.Contains(where, want) {
 			t.Fatalf("where clause missing %q in %q", want, where)
 		}
 	}
-	if len(args) != 4 {
-		t.Fatalf("args len = %d, want 4", len(args))
+	if len(args) != 7 {
+		t.Fatalf("args len = %d, want 7", len(args))
 	}
 }
 
@@ -76,8 +80,8 @@ func TestBatchUpdateChunkEnabledStatusUpdatesEveryEmbeddingTable(t *testing.T) {
 
 	repo := &mysqlRepository{db: db, database: "weknora", tablePrefix: defaultTablePrefix}
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT TABLE_NAME FROM information_schema.tables
-		WHERE TABLE_SCHEMA = ? AND TABLE_NAME LIKE ?`)).
-		WithArgs("weknora", defaultTablePrefix+"%").
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME LIKE ? ESCAPE '\\'`)).
+		WithArgs("weknora", escapeLikePattern(defaultTablePrefix)+"%").
 		WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME"}).AddRow("weknora_embeddings_768"))
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE `weknora_embeddings_768` SET is_enabled = ? WHERE chunk_id IN (?)")).
 		WithArgs(true, "chunk-enabled").
@@ -107,8 +111,8 @@ func TestBatchUpdateChunkTagIDUpdatesEveryEmbeddingTable(t *testing.T) {
 
 	repo := &mysqlRepository{db: db, database: "weknora", tablePrefix: defaultTablePrefix}
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT TABLE_NAME FROM information_schema.tables
-		WHERE TABLE_SCHEMA = ? AND TABLE_NAME LIKE ?`)).
-		WithArgs("weknora", defaultTablePrefix+"%").
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME LIKE ? ESCAPE '\\'`)).
+		WithArgs("weknora", escapeLikePattern(defaultTablePrefix)+"%").
 		WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME"}).AddRow("weknora_embeddings_1024"))
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE `weknora_embeddings_1024` SET tag_id = ? WHERE chunk_id IN (?)")).
 		WithArgs("tag-a", "chunk-a").
@@ -117,6 +121,62 @@ func TestBatchUpdateChunkTagIDUpdatesEveryEmbeddingTable(t *testing.T) {
 	err = repo.BatchUpdateChunkTagID(context.Background(), map[string]string{"chunk-a": "tag-a"})
 	if err != nil {
 		t.Fatalf("BatchUpdateChunkTagID() error = %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestInsertRowsUpsertsMutableFields(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	repo := &mysqlRepository{db: db}
+	mock.ExpectExec("ON DUPLICATE KEY UPDATE .*content=VALUES\\(content\\).*embedding=VALUES\\(embedding\\)").
+		WithArgs(
+			"faq-1", "updated content", "faq-1", int(types.ChunkSourceType),
+			"chunk-1", "knowledge-1", "kb-1", "tag-1", true,
+		).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	err = repo.insertRows(context.Background(), "weknora_embeddings_2", []*MysqlVectorEmbedding{{
+		ID:              "faq-1",
+		Content:         "updated content",
+		SourceID:        "faq-1",
+		SourceType:      int(types.ChunkSourceType),
+		ChunkID:         "chunk-1",
+		KnowledgeID:     "knowledge-1",
+		KnowledgeBaseID: "kb-1",
+		TagID:           "tag-1",
+		IsEnabled:       true,
+		Embedding:       []float32{0.1, 0.2},
+	}})
+	if err != nil {
+		t.Fatalf("insertRows() error = %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestDeleteBySourceIDListNoopsWhenDimensionTableMissing(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	repo := &mysqlRepository{db: db, database: "weknora", tablePrefix: defaultTablePrefix}
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT COUNT(1) FROM information_schema.tables
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?`)).
+		WithArgs("weknora", "weknora_embeddings_768").
+		WillReturnRows(sqlmock.NewRows([]string{"COUNT(1)"}).AddRow(0))
+
+	if err := repo.DeleteBySourceIDList(context.Background(), []string{"faq-1"}, 768, ""); err != nil {
+		t.Fatalf("DeleteBySourceIDList() error = %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
@@ -136,6 +196,35 @@ func TestLimitTopKByScoreSortsGlobally(t *testing.T) {
 	}
 	if got[0].ID != "high" || got[1].ID != "mid" {
 		t.Fatalf("unexpected order: %#v", got)
+	}
+}
+
+func TestScanRetrieveRowsTreatsNullEnabledAsEnabled(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{
+		"id", "content", "source_id", "source_type", "chunk_id",
+		"knowledge_id", "knowledge_base_id", "tag_id", "is_enabled", "score",
+	}).AddRow(
+		"id-1", "content", "source-1", int(types.ChunkSourceType), "chunk-1",
+		"knowledge-1", "kb-1", "tag-1", nil, 0.8,
+	))
+	rows, err := db.QueryContext(context.Background(), "SELECT")
+	if err != nil {
+		t.Fatalf("query rows: %v", err)
+	}
+	defer rows.Close()
+
+	got, err := scanRetrieveRows(rows, types.MatchTypeKeywords)
+	if err != nil {
+		t.Fatalf("scanRetrieveRows() error = %v", err)
+	}
+	if len(got) != 1 || !got[0].IsEnabled {
+		t.Fatalf("unexpected rows: %#v", got)
 	}
 }
 

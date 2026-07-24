@@ -34,6 +34,7 @@ func TestCreateTableSQLTemplate(t *testing.T) {
 		"INDEX idx_tag",
 		"INDEX idx_enabled",
 		"FULLTEXT INDEX idx_content_ft",
+		"WITH PARSER ngram",
 		"embedding JSON NOT NULL",
 		"ENGINE=InnoDB",
 		"CHARSET=utf8mb4",

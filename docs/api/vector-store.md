@@ -2,7 +2,7 @@
 
 [返回目录](./README.md)
 
-向量存储（VectorStore）API 用于管理租户的向量数据库连接配置，支持 Elasticsearch、PostgreSQL、Qdrant、Milvus、Weaviate、Tencent VectorDB、SQLite 等引擎。接口同时管理用户在 DB 中创建的配置（`source: "user"`）以及通过 `RETRIEVE_DRIVER` 环境变量配置的虚拟存储（`source: "env"`，只读）。
+向量存储（VectorStore）API 用于管理空间的向量数据库连接配置，支持 Elasticsearch、PostgreSQL、Qdrant、Milvus、Weaviate、Tencent VectorDB、SQLite 等引擎。接口同时管理用户在 DB 中创建的配置（`source: "user"`）以及通过 `RETRIEVE_DRIVER` 环境变量配置的虚拟存储（`source: "env"`，只读）。
 
 | 方法   | 路径                         | 描述                             |
 | ------ | ---------------------------- | -------------------------------- |
@@ -122,13 +122,13 @@ curl --location --request POST 'http://localhost:8080/api/v1/vector-stores/test'
 
 ## POST `/vector-stores` - 创建向量存储
 
-为当前租户创建一个新的向量存储配置。同一 endpoint + index 组合在租户内不允许重复（与环境变量配置的存储也会冲突）。
+为当前空间创建一个新的向量存储配置。同一 endpoint + index 组合在空间内不允许重复（与环境变量配置的存储也会冲突）。
 
 **参数说明（请求体）**:
 
 | 字段              | 类型   | 必填 | 说明                                                            |
 | ----------------- | ------ | ---- | --------------------------------------------------------------- |
-| name              | string | 是   | 存储显示名（租户内友好名）                                       |
+| name              | string | 是   | 存储显示名（空间内友好名）                                       |
 | engine_type       | string | 是   | 引擎类型，取自 `/vector-stores/types`                            |
 | connection_config | object | 是   | 连接配置（与所选引擎的 `connection_fields` 对应）                |
 | index_config      | object | 否   | 索引配置（与所选引擎的 `index_fields` 对应）                     |
@@ -206,7 +206,7 @@ curl --location 'http://localhost:8080/api/v1/vector-stores' \
 
 ## GET `/vector-stores` - 获取向量存储列表
 
-返回当前租户的所有向量存储，包含 `RETRIEVE_DRIVER` 环境变量配置的虚拟存储（`source: "env"`、`readonly: true`）和用户在 DB 中创建的存储（`source: "user"`、`readonly: false`）。环境变量存储排列在前。
+返回当前空间的所有向量存储，包含 `RETRIEVE_DRIVER` 环境变量配置的虚拟存储（`source: "env"`、`readonly: true`）和用户在 DB 中创建的存储（`source: "user"`、`readonly: false`）。环境变量存储排列在前。
 
 **请求**:
 
@@ -348,7 +348,7 @@ curl --location --request PUT 'http://localhost:8080/api/v1/vector-stores/550e84
 
 **Phase 2 — 绑定保护**：
 
-删除请求在事务中执行，并按 `(tenant_id, vector_store_id)` 复合索引统计当前租户中仍绑定到该存储的活跃知识库数量。**只要存在任意绑定的知识库（已软删除的 KB 不计入），删除即被拒绝**，调用者必须先解绑或删除这些知识库才能继续。在 PostgreSQL 上，事务期间会对 `vector_stores` 行加 `SELECT … FOR UPDATE` 行锁，阻止并发的知识库创建请求悄悄落到正在被删除的存储上（SQLite 上则依赖 WAL + 单写入序列化达成同样语义）。
+删除请求在事务中执行，并按 `(tenant_id, vector_store_id)` 复合索引统计当前空间中仍绑定到该存储的活跃知识库数量。**只要存在任意绑定的知识库（已软删除的 KB 不计入），删除即被拒绝**，调用者必须先解绑或删除这些知识库才能继续。在 PostgreSQL 上，事务期间会对 `vector_stores` 行加 `SELECT … FOR UPDATE` 行锁，阻止并发的知识库创建请求悄悄落到正在被删除的存储上（SQLite 上则依赖 WAL + 单写入序列化达成同样语义）。
 
 **路径参数**:
 
@@ -383,7 +383,7 @@ curl --location --request DELETE 'http://localhost:8080/api/v1/vector-stores/550
 }
 ```
 
-HTTP `400`。错误消息中包含具体的知识库数量（便于运营定位），但不包含任何 KB 的 ID/名称，以避免跨租户信息泄漏。删除被拒绝时，DB 中的存储行保持原状，进程内引擎注册表也不会被清除。
+HTTP `400`。错误消息中包含具体的知识库数量（便于运营定位），但不包含任何 KB 的 ID/名称，以避免跨空间信息泄漏。删除被拒绝时，DB 中的存储行保持原状，进程内引擎注册表也不会被清除。
 
 ## POST `/vector-stores/:id/test` - 测试已保存或环境变量存储的连接
 
@@ -442,9 +442,9 @@ MySQL 环境变量存储使用 `RETRIEVE_DRIVER=mysql`，并读取 `MYSQL_HOST`�
 | HTTP 状态码 | code | 含义                                                |
 | ----------- | ---- | --------------------------------------------------- |
 | 400         | 1000 | 请求参数错误、校验失败、尝试修改环境变量存储、删除时仍有知识库绑定 |
-| 400         | 2200 | 知识库创建时引用的 `vector_store_id` 无效（不存在或属于其他租户） |
+| 400         | 2200 | 知识库创建时引用的 `vector_store_id` 无效（不存在或属于其他空间） |
 | 400         | 2201 | 知识库创建时引用的存储当前不可用（DB 中存在但未注册到引擎） |
-| 401         | 1001 | 未认证（缺少租户上下文或 API Key）                    |
+| 401         | 1001 | 未认证（缺少空间上下文或 API Key）                    |
 | 404         | 1003 | 向量存储不存在                                       |
 | 409         | 1005 | 同一 endpoint + index 组合已存在                     |
 | 500         | 1007 | 内部服务器错误                                       |

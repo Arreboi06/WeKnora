@@ -170,7 +170,11 @@ func (r *mysqlRepository) insertRows(
 	}
 
 	stmt := fmt.Sprintf(
-		"INSERT INTO %s (%s) VALUES %s ON DUPLICATE KEY UPDATE id=id",
+		"INSERT INTO %s (%s) VALUES %s ON DUPLICATE KEY UPDATE "+
+			"content=VALUES(content), source_id=VALUES(source_id), source_type=VALUES(source_type), "+
+			"chunk_id=VALUES(chunk_id), knowledge_id=VALUES(knowledge_id), "+
+			"knowledge_base_id=VALUES(knowledge_base_id), tag_id=VALUES(tag_id), "+
+			"is_enabled=VALUES(is_enabled), embedding=VALUES(embedding)",
 		quoteIdentifier(table),
 		strings.Join(columns, ", "),
 		strings.Join(parts, ", "),
@@ -221,6 +225,14 @@ func (r *mysqlRepository) deleteByField(
 	}
 
 	table := r.getTableName(dimension)
+	exists, err := r.tableExists(ctx, table)
+	if err != nil {
+		return fmt.Errorf("check table %s: %w", table, err)
+	}
+	if !exists {
+		return nil
+	}
+
 	placeholders := make([]string, len(ids))
 	args := make([]interface{}, len(ids))
 	for i, id := range ids {
@@ -413,6 +425,12 @@ func buildVectorWhereClause(params types.RetrieveParams) *whereBuilder {
 	if len(params.TagIDs) > 0 {
 		wb.addIN("tag_id", params.TagIDs)
 	}
+	if len(params.ExcludeKnowledgeIDs) > 0 {
+		wb.addNotIN("knowledge_id", params.ExcludeKnowledgeIDs)
+	}
+	if len(params.ExcludeChunkIDs) > 0 {
+		wb.addNotIN("chunk_id", params.ExcludeChunkIDs)
+	}
 	wb.add("(is_enabled IS NULL OR is_enabled = TRUE)")
 
 	return wb
@@ -475,6 +493,18 @@ func (wb *whereBuilder) addIN(field string, values []string) {
 		wb.args = append(wb.args, v)
 	}
 	wb.conditions = append(wb.conditions, fmt.Sprintf("%s IN (%s)", field, strings.Join(placeholders, ",")))
+}
+
+func (wb *whereBuilder) addNotIN(field string, values []string) {
+	if len(values) == 0 {
+		return
+	}
+	placeholders := make([]string, len(values))
+	for i, v := range values {
+		placeholders[i] = "?"
+		wb.args = append(wb.args, v)
+	}
+	wb.conditions = append(wb.conditions, fmt.Sprintf("%s NOT IN (%s)", field, strings.Join(placeholders, ",")))
 }
 
 func (wb *whereBuilder) build() (string, []interface{}) {
@@ -697,7 +727,7 @@ func scanRetrieveRows(rows *sql.Rows, matchType types.MatchType) ([]*types.Index
 			id, content, sourceID, chunkID      string
 			knowledgeID, knowledgeBaseID, tagID string
 			sourceType                          int
-			isEnabled                           bool
+			isEnabled                           sql.NullBool
 			score                               float64
 		)
 		err := rows.Scan(&id, &content, &sourceID, &sourceType,
@@ -716,7 +746,7 @@ func scanRetrieveRows(rows *sql.Rows, matchType types.MatchType) ([]*types.Index
 			TagID:           tagID,
 			Score:           score,
 			MatchType:       matchType,
-			IsEnabled:       isEnabled,
+			IsEnabled:       !isEnabled.Valid || isEnabled.Bool,
 		})
 	}
 	return out, rows.Err()

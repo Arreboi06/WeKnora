@@ -60,6 +60,12 @@ func TestQuoteIdentifierEscapesBackticks(t *testing.T) {
 	}
 }
 
+func TestEscapeLikePatternEscapesPrefixWildcards(t *testing.T) {
+	if got := escapeLikePattern(`weknora_embeddings_%\`); got != `weknora\_embeddings\_\%\\` {
+		t.Fatalf("escapeLikePattern() = %q", got)
+	}
+}
+
 func TestCosineSimilarityExprUsesPortableJSONFunctions(t *testing.T) {
 	got := cosineSimilarityExpr("embedding", []float32{1, 2})
 	for _, want := range []string{

@@ -2,6 +2,7 @@ package repository
 
 import (
 	"fmt"
+	"strings"
 
 	"gorm.io/gorm"
 )
@@ -43,6 +44,12 @@ func jsonTextExpr(db *gorm.DB, column, path string) string {
 	}
 }
 
+func jsonPathForKey(key string) string {
+	key = strings.ReplaceAll(key, `\`, `\\`)
+	key = strings.ReplaceAll(key, `"`, `\"`)
+	return `$."` + key + `"`
+}
+
 func jsonTextCastExpr(db *gorm.DB, column string) string {
 	if isPostgres(db) {
 		return column + "::text"
@@ -51,6 +58,17 @@ func jsonTextCastExpr(db *gorm.DB, column string) string {
 		return "CAST(" + column + " AS CHAR)"
 	}
 	return "CAST(" + column + " AS TEXT)"
+}
+
+func jsonPathTextCastExpr(db *gorm.DB, column, path string) string {
+	switch dialectName(db) {
+	case "postgres":
+		return fmt.Sprintf("CAST(COALESCE(%s->'%s', '[]'::jsonb) AS TEXT)", column, path)
+	case "mysql":
+		return fmt.Sprintf("CAST(COALESCE(JSON_EXTRACT(%s, '$.%s'), JSON_ARRAY()) AS CHAR)", column, path)
+	default:
+		return fmt.Sprintf("CAST(COALESCE(json_extract(%s, '$.%s'), '[]') AS TEXT)", column, path)
+	}
 }
 
 func jsonArrayLengthExpr(db *gorm.DB, column string) string {

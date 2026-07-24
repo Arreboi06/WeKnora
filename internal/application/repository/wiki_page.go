@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -36,6 +37,10 @@ func (r *wikiPageRepository) wikiCategoryRankOrder() string {
 		return "CASE WHEN COALESCE(JSON_LENGTH(category_path), 0) > 0 THEN 0 ELSE 1 END ASC"
 	}
 	return "CASE WHEN COALESCE(jsonb_array_length(category_path), 0) > 0 THEN 0 ELSE 1 END ASC"
+}
+
+func (r *wikiPageRepository) wikiEmptyInLinksPredicate() string {
+	return "(in_links IS NULL OR " + jsonArrayLengthExpr(r.db, "in_links") + " = 0)"
 }
 
 // Create inserts a new wiki page record
@@ -470,6 +475,10 @@ var ErrWikiFolderNotFound = errors.New("wiki folder not found")
 // already exists under the same parent.
 var ErrWikiFolderConflict = errors.New("wiki folder name conflict")
 
+// ErrWikiFolderNotEmpty is returned when a folder still has a live page or
+// child folder at the instant an atomic delete is attempted.
+var ErrWikiFolderNotEmpty = errors.New("wiki folder is not empty")
+
 func (r *wikiPageRepository) CreateFolder(ctx context.Context, folder *types.WikiFolder) error {
 	return r.db.WithContext(ctx).Create(folder).Error
 }
@@ -550,14 +559,34 @@ func (r *wikiPageRepository) UpdateFolder(ctx context.Context, folder *types.Wik
 }
 
 func (r *wikiPageRepository) DeleteFolder(ctx context.Context, kbID string, id string) error {
-	result := r.db.WithContext(ctx).
-		Where("knowledge_base_id = ? AND id = ?", kbID, id).
-		Delete(&types.WikiFolder{})
+	// Keep the emptiness test in the same SQL statement as the soft delete.
+	// A page move or child-folder create can race the service's earlier checks;
+	// a check-then-delete sequence would otherwise leave a dangling folder_id.
+	result := r.db.WithContext(ctx).Exec(`
+UPDATE wiki_folders
+SET deleted_at = ?
+WHERE knowledge_base_id = ? AND id = ? AND deleted_at IS NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM wiki_pages
+    WHERE knowledge_base_id = ? AND folder_id = ? AND deleted_at IS NULL
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM wiki_folders AS child
+    WHERE child.knowledge_base_id = ? AND child.parent_id = ? AND child.deleted_at IS NULL
+  )`, time.Now(), kbID, id, kbID, id, kbID, id)
 	if result.Error != nil {
 		return result.Error
 	}
 	if result.RowsAffected == 0 {
-		return ErrWikiFolderNotFound
+		var count int64
+		if err := r.db.WithContext(ctx).Model(&types.WikiFolder{}).
+			Where("knowledge_base_id = ? AND id = ?", kbID, id).Count(&count).Error; err != nil {
+			return err
+		}
+		if count == 0 {
+			return ErrWikiFolderNotFound
+		}
+		return ErrWikiFolderNotEmpty
 	}
 	return nil
 }
@@ -972,8 +1001,28 @@ func escapeLikePattern(s string) string {
 	return replacer.Replace(s)
 }
 
-// Search performs case-insensitive POSIX regex search on wiki pages within a knowledge base.
-// The query is interpreted as a PostgreSQL regular expression (via ~*).
+func wikiSearchCondition(db *gorm.DB, column string) string {
+	switch dialectName(db) {
+	case "postgres":
+		return column + " ~* ?"
+	case "mysql":
+		return "REGEXP_LIKE(" + column + ", ?, 'i')"
+	default:
+		return caseInsensitiveLikeCondition(db, column)
+	}
+}
+
+func wikiSearchArg(db *gorm.DB, query string) string {
+	switch dialectName(db) {
+	case "postgres", "mysql":
+		return query
+	default:
+		return "%" + escapeLikePattern(query) + "%"
+	}
+}
+
+// Search performs case-insensitive search on wiki pages within a knowledge base.
+// PostgreSQL and MySQL use their native regex operators; SQLite falls back to LIKE.
 //
 // Results are ranked by where the query hit, highest-relevance first:
 //
@@ -995,22 +1044,29 @@ func (r *wikiPageRepository) Search(ctx context.Context, kbID string, query stri
 		limit = 50
 	}
 
+	matchArg := wikiSearchArg(r.db, query)
+
 	// CASE expression is evaluated per-row during SELECT; we order by the
 	// alias so the DB only computes the rank once. Parameterized four
-	// times with the same regex to avoid coupling to GORM's positional
+	// times with the same search term to avoid coupling to GORM's positional
 	// arg rewriting quirks.
 	rankExpr := "CASE " +
-		"WHEN title ~* ? THEN 4 " +
-		"WHEN slug ~* ? THEN 3 " +
-		"WHEN summary ~* ? THEN 2 " +
-		"WHEN content ~* ? THEN 1 " +
+		"WHEN " + wikiSearchCondition(r.db, "title") + " THEN 4 " +
+		"WHEN " + wikiSearchCondition(r.db, "slug") + " THEN 3 " +
+		"WHEN " + wikiSearchCondition(r.db, "summary") + " THEN 2 " +
+		"WHEN " + wikiSearchCondition(r.db, "content") + " THEN 1 " +
 		"ELSE 0 END AS match_rank"
+
+	whereExpr := "knowledge_base_id = ? AND (" +
+		wikiSearchCondition(r.db, "title") + " OR " +
+		wikiSearchCondition(r.db, "content") + " OR " +
+		wikiSearchCondition(r.db, "summary") + " OR " +
+		wikiSearchCondition(r.db, "slug") + ")"
 
 	var pages []*types.WikiPage
 	if err := r.db.WithContext(ctx).
-		Select("*, "+rankExpr, query, query, query, query).
-		Where("knowledge_base_id = ? AND (title ~* ? OR content ~* ? OR summary ~* ? OR slug ~* ?)",
-			kbID, query, query, query, query).
+		Select("*, "+rankExpr, matchArg, matchArg, matchArg, matchArg).
+		Where(whereExpr, kbID, matchArg, matchArg, matchArg, matchArg).
 		Where("status != ?", "archived").
 		Order("match_rank DESC, updated_at DESC").
 		Limit(limit).
@@ -1049,7 +1105,7 @@ func (r *wikiPageRepository) CountOrphans(ctx context.Context, kbID string) (int
 	if err := r.db.WithContext(ctx).
 		Model(&types.WikiPage{}).
 		Where("knowledge_base_id = ?", kbID).
-		Where("(in_links IS NULL OR "+jsonArrayLengthExpr(r.db, "in_links")+" = 0)").
+		Where(r.wikiEmptyInLinksPredicate()).
 		// Exclude index and log pages as they are naturally root pages
 		Where("page_type NOT IN ?", []string{types.WikiPageTypeIndex, types.WikiPageTypeLog}).
 		Count(&count).Error; err != nil {

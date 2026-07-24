@@ -63,6 +63,12 @@ func TestDialectHelpersJSONExpressions(t *testing.T) {
 	if got := jsonTextCastExpr(dbWithDialect("mysql"), "source_refs"); got != "CAST(source_refs AS CHAR)" {
 		t.Fatalf("mysql json cast = %q", got)
 	}
+	if got := jsonPathForKey(`external"id`); got != `$."external\"id"` {
+		t.Fatalf("json path = %q", got)
+	}
+	if got := jsonPathTextCastExpr(dbWithDialect("sqlite"), "metadata", "answers"); got != "CAST(COALESCE(json_extract(metadata, '$.answers'), '[]') AS TEXT)" {
+		t.Fatalf("sqlite json path cast = %q", got)
+	}
 }
 
 func TestDialectHelpersSourceRefs(t *testing.T) {

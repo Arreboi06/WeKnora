@@ -1,6 +1,9 @@
 package database
 
 import (
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -46,4 +49,100 @@ func TestMigrationDSNFromEnvBuildsMySQLURL(t *testing.T) {
 			t.Fatalf("mysql migration dsn missing %q in %s", want, dsn)
 		}
 	}
+}
+
+func TestMySQLMigrationsCoverCurrentMainVersion(t *testing.T) {
+	const currentMainMigration = 74
+
+	versions := mysqlMigrationVersions(t)
+	if len(versions) == 0 {
+		t.Fatal("no MySQL migrations found")
+	}
+	for version := 64; version <= currentMainMigration; version++ {
+		if !versions[version] {
+			t.Fatalf("missing MySQL migration version %06d", version)
+		}
+	}
+}
+
+func TestMySQLTenantMembersUniqueIndexAllowsSoftDeletedReadd(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("..", "..", "migrations", "mysql", "000066_expand_knowledge_span_name.up.sql"))
+	if err != nil {
+		t.Fatalf("read mysql migration 66: %v", err)
+	}
+	text := string(body)
+	for _, want := range []string{
+		"active_unique_key TINYINT",
+		"CASE WHEN deleted_at IS NULL THEN 1 ELSE NULL END",
+		"CREATE UNIQUE INDEX idx_tenant_members_user_tenant_unique",
+		"ON tenant_members(user_id, tenant_id, active_unique_key)",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("tenant_members MySQL migration missing %q", want)
+		}
+	}
+}
+
+func TestMySQLDeploymentConfigWiresOfficialArtifacts(t *testing.T) {
+	files := map[string][]string{
+		filepath.Join("..", "..", "docker-compose.mysql.yml"): {
+			"mysql:",
+			"mysql-data:",
+			"DB_HOST=${DB_HOST:-mysql}",
+			"condition: service_healthy",
+		},
+		filepath.Join("..", "..", "docker", "Dockerfile.app"): {
+			"go install -tags 'postgres mysql sqlite3'",
+		},
+		filepath.Join("..", "..", "helm", "templates", "app.yaml"): {
+			"value: {{ .Values.database.driver | quote }}",
+			"value: {{ .Values.database.host | quote }}",
+			"value: {{ .Values.database.port | quote }}",
+		},
+		filepath.Join("..", "..", "helm", "values.yaml"): {
+			"database:",
+			"driver: postgres",
+			"host: postgres",
+			"port: \"5432\"",
+		},
+	}
+
+	for file, wants := range files {
+		body, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+		text := string(body)
+		for _, want := range wants {
+			if !strings.Contains(text, want) {
+				t.Fatalf("%s missing %q", file, want)
+			}
+		}
+	}
+}
+
+func mysqlMigrationVersions(t *testing.T) map[int]bool {
+	t.Helper()
+
+	files, err := filepath.Glob(filepath.Join("..", "..", "migrations", "mysql", "*.up.sql"))
+	if err != nil {
+		t.Fatalf("glob mysql migrations: %v", err)
+	}
+	versions := make(map[int]bool, len(files))
+	for _, file := range files {
+		base := filepath.Base(file)
+		if len(base) < 6 {
+			continue
+		}
+		version, err := strconv.Atoi(base[:6])
+		if err != nil {
+			continue
+		}
+		down := filepath.Join(filepath.Dir(file), base[:6]+base[6:len(base)-len(".up.sql")]+".down.sql")
+		if _, err := os.Stat(down); err != nil {
+			t.Fatalf("missing down migration for %s: %v", base, err)
+		}
+		versions[version] = true
+	}
+	return versions
 }

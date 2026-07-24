@@ -45,8 +45,9 @@ func scopeCustomAgentsByModelID(db *gorm.DB, modelID string) *gorm.DB {
 		return db.Where(
 			"config->>'model_id' = ? OR config->>'rerank_model_id' = ? OR "+
 				"config->>'vlm_model_id' = ? OR config->>'asr_model_id' = ? OR "+
-				"config->>'query_understand_model_id' = ?",
-			modelID, modelID, modelID, modelID, modelID,
+				"config->>'query_understand_model_id' = ? OR "+
+				"config->'question_suggestions'->'follow_ups'->>'model_id' = ?",
+			modelID, modelID, modelID, modelID, modelID, modelID,
 		)
 	case "mysql":
 		return db.Where(
@@ -63,7 +64,8 @@ func scopeCustomAgentsByModelID(db *gorm.DB, modelID string) *gorm.DB {
 			"json_extract(config, '$.rerank_model_id') = ? OR "+
 			"json_extract(config, '$.vlm_model_id') = ? OR "+
 			"json_extract(config, '$.asr_model_id') = ? OR "+
-			"json_extract(config, '$.query_understand_model_id') = ?",
-		modelID, modelID, modelID, modelID, modelID,
+			"json_extract(config, '$.query_understand_model_id') = ? OR "+
+			"json_extract(config, '$.question_suggestions.follow_ups.model_id') = ?",
+		modelID, modelID, modelID, modelID, modelID, modelID,
 	)
 }
