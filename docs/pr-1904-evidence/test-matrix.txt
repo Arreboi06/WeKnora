@@ -1,0 +1,12 @@
+﻿RUN go test -count=1 ./internal/application/repository
+ok  	github.com/Tencent/WeKnora/internal/application/repository	4.283s
+RUN go test -count=1 ./internal/application/repository/retriever/mysql
+ok  	github.com/Tencent/WeKnora/internal/application/repository/retriever/mysql	4.325s
+RUN go test -count=1 ./internal/database -run 'Test.*MySQL|TestMigration'
+ok  	github.com/Tencent/WeKnora/internal/database	3.404s
+RUN go test -count=1 ./internal/types -run 'TestGetVectorStoreTypes|TestVectorStore'
+ok  	github.com/Tencent/WeKnora/internal/types	3.147s
+RUN go test -count=1 ./internal/container -run 'Test.*MySQL|Test.*Database|Test.*Engine'
+ok  	github.com/Tencent/WeKnora/internal/container	8.346s
+RUN git diff --check refs/remotes/audit-upstream/main...HEAD
+PASS

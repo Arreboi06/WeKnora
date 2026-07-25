@@ -1,0 +1,6 @@
+﻿register_status=201
+login_status=200
+active_tenant_id=10001 membership_role=owner
+types_status=200 mysql_type_present=True mysql_fields=4
+stores_status=200 mysql_env_store_id=__env_mysql__ readonly=True
+env_store_test_status=200 body={"success":true,"version":"8.4.10"}

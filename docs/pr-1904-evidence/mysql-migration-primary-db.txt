@@ -1,0 +1,14 @@
+﻿migration_up_first=start
+after_up_first version=74 dirty=false
+after_up_first table_count=51
+primary_db_read_write=start
+tenant_row=id name first_engine
+tenant_row=10000 pr1904 mysql final smoke mysql
+tenant_description=updated by live final smoke
+tenant_remaining=0
+migration_down=start
+after_down version=nil dirty=false
+after_down table_count=1
+migration_up_second=start
+after_up_second version=74 dirty=false
+after_up_second table_count=51
