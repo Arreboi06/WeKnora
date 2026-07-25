@@ -4,11 +4,11 @@ These assets are referenced from the PR #1888 body only. They are kept on the fo
 
 ## Assets
 
-- `01-feedback-overview.png` — knowledge-base feedback settings overview.
-- `02-low-quality-chunks.png` — low-quality chunk list with positive rate, recall weight, and pending optimization state.
-- `03-chunk-detail-weight-logs.png` — chunk detail, dislike reason aggregation, and weight log display.
-- `04-feedback-demo.gif` — chat feedback interaction demo.
-- `06-final-verification.png` — final local verification matrix after the hardening pass.
+- `01-feedback-overview.png` - knowledge-base feedback settings overview.
+- `02-low-quality-chunks.png` - low-quality chunk list with positive rate, recall weight, and pending optimization state.
+- `03-chunk-detail-weight-logs.png` - chunk detail, dislike reason aggregation, and weight log display.
+- `04-feedback-demo.gif` - chat feedback interaction demo.
+- `06-final-verification.png` - final local verification matrix after merging `Tencent/main` and rerunning checks.
 
 ## PR
 
