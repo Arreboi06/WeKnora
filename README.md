@@ -2,28 +2,36 @@
 
 This branch stores screenshots for Tencent/WeKnora#1891 only. It is not used as the PR head branch, so the implementation diff remains clean.
 
-Validated product path:
+> [!IMPORTANT]
+> Every UI screenshot in this branch was captured against a local demo/mock API.
+> The images demonstrate the WeKnora product flow and are **not** evidence that a
+> live DingTalk tenant API was exercised. A live-tenant end-to-end run has not
+> yet been performed.
 
-Knowledge Base Settings -> Data Sources -> Data Source Management -> Add data source
+Demonstrated product path:
+
+`Knowledge Base Settings -> Data Sources -> Data Source Management -> Add data source`
 
 Screenshots:
 
-1. `dingtalk/01-kb-list-dingtalk-demo.png` - demo knowledge base used for validation.
-2. `dingtalk/02-kb-settings-datasource-list.png` - data source management with an existing DingTalk data source.
-3. `dingtalk/03-add-datasource-type-selection.png` - add data source drawer with DingTalk Docs.
-4. `dingtalk/04-dingtalk-credentials-tested.png` - DingTalk credential form and successful connection test.
-5. `dingtalk/05-dingtalk-resource-picker-root.png` - DingTalk resource picker at workspace level.
-6. `dingtalk/06-dingtalk-resource-picker-expanded.png` - expanded DingTalk workspace showing folders/documents.
-7. `dingtalk/07-dingtalk-sync-history-open.png` - sync history drawer with successful DingTalk sync metrics and expanded details.
+1. `dingtalk/01-kb-list-dingtalk-demo.png` - local demo knowledge base.
+2. `dingtalk/02-kb-settings-datasource-list.png` - local mock data-source management view.
+3. `dingtalk/03-add-datasource-type-selection.png` - local mock add-data-source drawer.
+4. `dingtalk/04-dingtalk-credentials-tested.png` - local mock credential-flow success state.
+5. `dingtalk/05-dingtalk-resource-picker-root.png` - local mock resource picker at workspace level.
+6. `dingtalk/06-dingtalk-resource-picker-expanded.png` - local mock workspace/folder/document tree.
+7. `dingtalk/07-dingtalk-sync-history-open.png` - local mock sync-history state and metrics.
 
-Local targeted test:
+## Validation artifact boundary
 
-```bash
-go test ./internal/datasource/connector/dingtalk -count=1
-```
+The files under `validation/` are a historical local snapshot captured for the
+earlier PR head. They are retained for traceability, but their timing and summary
+image are not the current validation record.
 
-Result:
+The current implementation head and re-run command results are documented in
+the PR body:
 
-```text
-ok github.com/Tencent/WeKnora/internal/datasource/connector/dingtalk 6.161s
-```
+https://github.com/Tencent/WeKnora/pull/1891
+
+Current PR head at the time of this clarification:
+`5ac28da7dcded37d069c72241705fb0f5b08550a`.
