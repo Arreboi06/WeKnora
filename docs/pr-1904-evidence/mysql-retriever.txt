@@ -1,6 +1,7 @@
-﻿engine=mysql support=[keywords vector]
+engine=mysql support=[keywords vector]
 after_save row_count=2
 vector_retrieve first_chunk=chunk-alpha
 vector_exclude_chunk first_chunk=chunk-beta
 keyword_retrieve first_chunk=chunk-alpha
 after_delete_alpha row_count=0
+mysql_retriever_chain=pass

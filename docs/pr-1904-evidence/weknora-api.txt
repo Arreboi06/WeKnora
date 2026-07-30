@@ -1,6 +1,13 @@
-﻿register_status=201
-login_status=200
-active_tenant_id=10001 membership_role=owner
-types_status=200 mysql_type_present=True mysql_fields=4
-stores_status=200 mysql_env_store_id=__env_mysql__ readonly=True
-env_store_test_status=200 body={"success":true,"version":"8.4.10"}
+# WeKnora API live evidence
+
+## server health
+server_started pid=39944 port=18082 health_status=200 health_body={"status":"ok"}
+
+
+## auth + vector-store API
+register_status=201 success=True user_id=cc59cd59-3186-4676-b9f9-d5e803745a79 email=pr1904-20260730131905@example.test
+login_status=200 success=True active_tenant_id=10000 membership_role=owner token_len=299
+types_status=200 success=True mysql_type_present=True mysql_fields=4
+stores_status=200 success=True mysql_env_store_id=__env_mysql__ engine=mysql readonly=True source=env
+env_store_test_status=200 success=True version=8.4.10
+weknora_api_mysql_chain=pass

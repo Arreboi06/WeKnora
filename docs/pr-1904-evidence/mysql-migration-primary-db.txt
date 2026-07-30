@@ -1,14 +1,40 @@
-﻿migration_up_first=start
-after_up_first version=74 dirty=false
-after_up_first table_count=51
-primary_db_read_write=start
-tenant_row=id name first_engine
-tenant_row=10000 pr1904 mysql final smoke mysql
-tenant_description=updated by live final smoke
-tenant_remaining=0
-migration_down=start
-after_down version=nil dirty=false
-after_down table_count=1
-migration_up_second=start
-after_up_second version=74 dirty=false
-after_up_second table_count=51
+# MySQL migration / primary DB live evidence
+
+## mysql-runtime
+{"Runtime":"D:\\agent\\runtime\\weknora-pr1904-final-20260730-131329","Port":3310,"Pid":40408,"DataDir":"D:\\agent\\runtime\\weknora-pr1904-final-20260730-131329\\mysql-data","InitLog":"D:\\agent\\runtime\\weknora-pr1904-final-20260730-131329\\mysql-init.log","RunLog":"D:\\agent\\runtime\\weknora-pr1904-final-20260730-131329\\mysql-run.log","Head":"231d02cc61a82668f654c6187ea6dea278e5537e","Upstream":"cc846d8e2947300d38f681edff4b2c1a684b17f1"}
+
+
+## migration up/down/up
+migration_source=file://migrations/mysql
+initial_version=nil dirty=false
+after_up_version=78 dirty=false
+after_up_table_count=52
+wiki_page_revisions=1
+chunk_revisions=1
+metadata_external_id=1
+custom_metadata=1
+source_content=1
+after_down_version=nil dirty=false
+after_down_table_count=1
+after_second_up_version=78 dirty=false
+after_second_up_table_count=52
+
+
+## primary DB + repository metadata prefix
+primary_db_tenants_before=0 after=1 write_read=pass
+metadata_prefix_results=1 first_id=8f88bddb-95f9-4bd3-8616-5ced924edcf6 expected_child=8f88bddb-95f9-4bd3-8616-5ced924edcf6
+generated_metadata_external_id=nodeA#file#x
+repository_metadata_prefix=pass
+
+
+## server app DB migration/log audit
+app_schema_migrations=version=78 dirty=0
+app_table_count=52
+system_settings_key_column=1
+wiki_page_revisions=1
+chunk_revisions=1
+metadata_external_id=1
+log_contains_mysql_1064=False
+log_contains_unquoted_key_where=False
+log_contains_quoted_key_where=True
+server_migration_and_log_audit=pass
