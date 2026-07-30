@@ -5,8 +5,10 @@ This branch stores screenshots for Tencent/WeKnora#1891 only. It is not used as 
 > [!IMPORTANT]
 > Every UI screenshot in this branch was captured against a local demo/mock API.
 > The images demonstrate the WeKnora product flow and are **not** evidence that a
-> live DingTalk tenant API was exercised. A live-tenant end-to-end run has not
-> yet been performed.
+> live DingTalk tenant API was exercised. Live-tenant **connector-level** API
+> verification was later performed separately and is documented in
+> [`live-e2e/live-e2e-summary.md`](live-e2e/live-e2e-summary.md). A complete
+> browser-to-ingestion recording against the live tenant was not completed.
 
 Demonstrated product path:
 
@@ -33,5 +35,6 @@ the PR body:
 
 https://github.com/Tencent/WeKnora/pull/1891
 
-Current PR head at the time of this clarification:
-`5ac28da7dcded37d069c72241705fb0f5b08550a`.
+The live API observations are a separate, redacted record. No Client ID,
+Client Secret, access token, operator UnionID, workspace ID, node ID, or
+document content that could identify the tenant is stored in this branch.
