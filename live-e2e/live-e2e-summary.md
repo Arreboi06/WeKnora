@@ -27,7 +27,8 @@ dependent and are not represented as live-production evidence here.
 
 ## Live UI recording
 
-- Recording: `live-e2e/pr1891-dingtalk-live-ui-public-final.mp4`
+- Inline preview GIF: `live-e2e/pr1891-dingtalk-live-ui-public-final.gif`
+- Recording source MP4: `live-e2e/pr1891-dingtalk-live-ui-public-final.mp4`
 - Resource selection frame: `live-e2e/pr1891-resource-selection.png`
 - Sync success frame: `live-e2e/pr1891-sync-success.png`
 

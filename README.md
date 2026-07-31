@@ -28,12 +28,14 @@ Screenshots:
 
 Live-tenant UI evidence:
 
-1. `live-e2e/pr1891-dingtalk-live-ui-public-final.mp4` - redacted WeKnora UI
+1. `live-e2e/pr1891-dingtalk-live-ui-public-final.gif` - redacted animated
+   preview intended for inline display in the PR body.
+2. `live-e2e/pr1891-dingtalk-live-ui-public-final.mp4` - redacted WeKnora UI
    recording showing DingTalk datasource setup, credential validation, live
    resource selection, sync strategy, and successful datasource sync status.
-2. `live-e2e/pr1891-resource-selection.png` - redacted frame showing the
+3. `live-e2e/pr1891-resource-selection.png` - redacted frame showing the
    DingTalk workspace/folder/document tree selection.
-3. `live-e2e/pr1891-sync-success.png` - redacted frame showing the datasource
+4. `live-e2e/pr1891-sync-success.png` - redacted frame showing the datasource
    sync card after a successful live sync.
 
 ## Validation artifact boundary
