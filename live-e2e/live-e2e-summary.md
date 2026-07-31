@@ -1,6 +1,6 @@
-# DingTalk live-tenant connector verification
+# DingTalk live-tenant verification
 
-Date: 2026-07-30 (Asia/Shanghai)
+Dates: 2026-07-30 to 2026-07-31 (Asia/Shanghai)
 
 Implementation tested: `3858ff894f19ebfcb6b24f983ee67ce0b0f0e3c9`
 
@@ -10,17 +10,36 @@ latest Tencent main:
 
 ## Evidence boundary
 
-This record describes a connector-level test against a real DingTalk tenant.
-The test used an ephemeral Go harness located in the implementation worktree;
-the harness and all credentials were removed after the run and were never
-committed.
+This record combines two live-tenant evidence layers:
 
-This is **not** a claim that the complete WeKnora browser-to-ingestion flow was
-recorded against the live tenant. The screenshots elsewhere in this branch
-remain local mock evidence.
+1. a connector-level test against a real DingTalk tenant; and
+2. a credential-redacted WeKnora UI recording against a real DingTalk test
+   tenant, showing datasource setup, resource selection, sync strategy, and a
+   successful datasource sync status.
 
 All tenant identifiers, credentials, tokens, user identifiers, node identifiers,
 and document contents are intentionally omitted or summarized.
+
+This is **not** a claim that production RAG-answer E2E indexing was completed.
+The UI recording stops at datasource sync success. Downstream parsing,
+embedding, vector indexing, and final answer retrieval remain environment/model
+dependent and are not represented as live-production evidence here.
+
+## Live UI recording
+
+- Recording: `live-e2e/pr1891-dingtalk-live-ui-public-final.mp4`
+- Resource selection frame: `live-e2e/pr1891-resource-selection.png`
+- Sync success frame: `live-e2e/pr1891-sync-success.png`
+
+The recording is public-safe:
+
+- Client Secret is not visible.
+- Client ID and operator UnionID values are masked in the credential step.
+- The recording does not include access tokens, workspace IDs, node IDs, or raw
+  document content.
+- The recording ends on the successful datasource sync card and avoids
+  representing local parser/indexing environment issues as DingTalk connector
+  behavior.
 
 ## Observed API flow
 
@@ -36,6 +55,17 @@ The connector successfully:
 7. resolved workspace, folder, and single-document resource selections;
 8. restored ancestor resources for a selected descendant document; and
 9. performed an incremental re-run without returning unchanged documents.
+
+The live WeKnora UI run additionally showed:
+
+1. selecting DingTalk as the datasource type;
+2. configuring Client ID, Client Secret, and operator UnionID;
+3. passing the datasource connection test;
+4. loading the live DingTalk resource tree;
+5. selecting the DingTalk test workspace, nested folder, and documents;
+6. configuring incremental sync; and
+7. reaching datasource sync success with 3 fetched documents, 3 created, and 0
+   failed items.
 
 ## Redacted observations
 
@@ -64,15 +94,14 @@ The connector successfully:
   behavior, not an assertion that DingTalk's public documentation guarantees
   node ID and document key are universally interchangeable.
 
-## What this run did not prove
+## What these runs did not prove
 
 - It did not cover every DingTalk block or media type.
 - It did not prove behavior for every tenant, permission configuration, or
   extremely large workspace.
 - It did not exercise multi-instance token-cache sharing; the connector cache is
   process-local.
-- It did not record a complete live WeKnora UI flow through downstream storage
-  and indexing.
+- It did not prove production RAG-answer E2E indexing or retrieval.
 - It did not modify a live document between incremental runs; the second run
   verifies the unchanged-document path only.
 
