@@ -4,8 +4,9 @@ Date: 2026-07-30 (Asia/Shanghai)
 
 Implementation tested: `3858ff894f19ebfcb6b24f983ee67ce0b0f0e3c9`
 
-Current PR head after reliability and post-review follow-ups:
-`f3dd216a1e2765e2b7ad9cde528e524f98499dd9`
+Current PR head after reliability, post-review follow-ups, and merging the
+latest Tencent main:
+`18399351d4a8bb17a0f7e3ec12e8e5fad33fccd7`
 
 ## Evidence boundary
 
