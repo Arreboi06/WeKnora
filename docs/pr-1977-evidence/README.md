@@ -1,10 +1,10 @@
 # PR #1977 verification evidence
 
-Final implementation HEAD: `3ef2c60c7779c3dbc63b84e5373f5238c7c6b241`
+Final implementation HEAD: `78ea4ab3de2ac2c858e15acb48de27c7fa80f315`
 
-Latest official main: `f7ef782d585f149613b0e443e8575689bb2d3ab9`
+Latest official main: `8dd997f0f406c19ce4ec9acd622456d24eac2130`
 
-Merge-base after merge: `f7ef782d585f149613b0e443e8575689bb2d3ab9`
+Merge-base after merge: `8dd997f0f406c19ce4ec9acd622456d24eac2130`
 
 Implementation branch: `codex/issue-1679-content-cache`
 
@@ -34,14 +34,15 @@ All Go build/test cache, module cache, temporary files, and CGO artifacts were k
 
 ## Current verification
 
-- `go test ./internal/contentcache ./internal/application/repository/retriever/sqlite ./internal/application/repository/retriever/postgres -run 'Test(StableChunkID|CacheKeys|SQLite|Postgres)' -count=1` - PASS
+- `go test ./internal/application/repository/retriever/sqlite -count=1` - PASS
+- `go test ./internal/application/repository/retriever/postgres -count=1` - PASS
+- `go test ./internal/contentcache -count=1` - PASS
 - `go test ./internal/application/service -run 'Test(NextStableChunkID|MultimodalPendingKey|StableGeneratedQuestionID|GraphExtractCache|WikiMapCache|UpsertStableChunks|CollectReparse|DeleteReparse|KnowledgePostProcessSkipsSupersededAttempt|EnqueueImageMultimodalTasks|ImageMultimodalFinalizeFallbacks)' -count=1` - PASS
-- `go test ./internal/models/embedding -run 'TestCachedEmbedder(ReusesRedisCacheAcrossWrapperRebuild|InvalidatesOnConcreteModelMetadata|SingleflightsConcurrentMissSet|SingleflightsConcurrentBatchMissSet)' -count=1` - PASS
 - `go test ./internal/contentcache ./internal/models/embedding ./internal/application/repository/retriever/sqlite ./internal/application/repository/retriever/postgres ./internal/application/service -run '^$' -count=1` - PASS
 - `git diff --check` - PASS
 - `git diff --cached --check` - PASS
 
-Only evidence files were moved after the code validation commands above; implementation code did not change after those test runs.
+Only evidence files and the PR body were updated after the code validation commands above; implementation code did not change after those test runs.
 
 ## Not run
 
