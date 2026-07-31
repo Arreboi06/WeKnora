@@ -4,8 +4,8 @@ Date: 2026-07-30 (Asia/Shanghai)
 
 Implementation tested: `3858ff894f19ebfcb6b24f983ee67ce0b0f0e3c9`
 
-Final PR head after reliability follow-ups:
-`a518cffee8a6592cfc0711d9b4d3221a04ba7a6e`
+Current PR head after reliability and post-review follow-ups:
+`f3dd216a1e2765e2b7ad9cde528e524f98499dd9`
 
 ## Evidence boundary
 
@@ -75,7 +75,7 @@ The connector successfully:
 - It did not modify a live document between incremental runs; the second run
   verifies the unchanged-document path only.
 
-The later reliability changes in the final PR head are covered by unit,
-integration-style `httptest`, race, type-check, and build verification in the
-PR body. They were not rerun against the tenant and are not retroactively
-represented as part of this live run.
+The later reliability and post-review changes in the current PR head are
+covered by unit, integration-style `httptest`, race, type-check, and build
+verification in the PR body. They were not rerun against the tenant and are not
+retroactively represented as part of this live run.
