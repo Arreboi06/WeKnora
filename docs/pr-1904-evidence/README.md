@@ -6,8 +6,8 @@ PR prose as a substitute for tests. Secrets are intentionally omitted.
 
 ## Verified identity
 
-- Implementation HEAD: `57d70e4273897d9595c3539c0aff850bb10b5921`
-- Upstream base: `8dd997f0f406c19ce4ec9acd622456d24eac2130`
+- Implementation HEAD: `c5b0a356448f1c15c01656548b8dde2ba467588b`
+- Upstream base: `5780affdfc76342ddd0f5cf95b548a1a4d0b2a5a`
 - Local branch: `codex/issue-1418-main-db-compat`
 - `upstream base` is an ancestor of HEAD: yes
 - Worktree at final verification: clean
@@ -55,11 +55,29 @@ filter.” The regression test
 before the fix and passes on the final HEAD. Positive-threshold filtering is
 unchanged.
 
-## Exact final test matrix
+## Test matrix and final rebase gates
 
-All Go commands below used D-drive TEMP/TMP and the D-drive Go/toolchain cache.
-Real MySQL integration tests used MySQL 8.4.10 on `127.0.0.1:3310` and did not
-skip.
+The full matrix below ran on `57d70e4273897d9595c3539c0aff850bb10b5921`
+against upstream `8dd997f0f406c19ce4ec9acd622456d24eac2130`. Upstream
+then advanced by two commits touching five files outside this PR's file set.
+A conflict-free rebase produced the final HEAD shown above. `git range-diff`
+mapped both PR commits with `=` (patch-equivalent), and the changed-file
+intersection was empty.
+
+The following focused gates were then executed on exact final HEAD
+`c5b0a356`:
+
+| Exact-final gate | Result | Detail |
+| --- | --- | --- |
+| MySQL session-default migration regression | PASS | real strict-mode/UTC MySQL; 3.648s; no skip |
+| MySQL zero-threshold negative-cosine regression | PASS | 3.919s |
+| upstream `chat_pipeline` package | PASS | 4.210s |
+| combined batch-reparse + MySQL/database/vector-store/wiki/session service tests | PASS | 5.369s |
+| `go vet` on the two upstream-affected service packages | PASS | no diagnostics |
+| worktree/range `git diff --check` | PASS | no diagnostics |
+
+All Go commands used D-drive TEMP/TMP and the D-drive Go/toolchain cache. Real
+MySQL integration tests used MySQL 8.4.10 on `127.0.0.1:3310` and did not skip.
 
 | Area | Result | Observed Go time / detail |
 | --- | --- | --- |
@@ -74,18 +92,19 @@ skip.
 | `git diff --check` and `git diff tencent/main...HEAD --check` | PASS | no diagnostics |
 
 The Docker-backed Compose test could not run because Docker is not installed
-on this host. Exact-final static deployment tests passed. Standalone Compose
-and Helm rendering had also passed in the earlier deployment verification, but
-that is not represented as an exact-final Docker runtime test.
+on this host. Patch-equivalent full-matrix static deployment tests passed.
+Standalone Compose and Helm rendering had also passed in the earlier
+deployment verification, but that is not represented as an exact-final Docker
+runtime test.
 
 ## Real runtime and E2E evidence
 
 - MySQL Community Server 8.4.10, strict six-mode SQL session and UTC timezone
 - Schema migration version 79, `dirty=0`
 - Final WeKnora server binary:
-  `weknora-server-57d70e42.exe`, SHA-256
-  `611D25B713C09AA142AEE76C4B61D9EA719CFDA8DEDADBD885D9B6186285B999`
-- Final CLI binary: `weknora-cli-57d70e42.exe`, SHA-256
+  `weknora-server-c5b0a356.exe`, SHA-256
+  `BB2EE4F57A3906632C78BD078922112A90B2432CB010C3C5754A623A16A79014`
+- Final CLI binary: `weknora-cli-c5b0a356.exe`, SHA-256
   `1394239708D33D2E8292FAFB4A399D9CC0C50D4A711C796B994E7D5740EC7DD3`
 - Real DocReader 0.1.0 gRPC service
 - Real Ollama `all-minilm` 384-dimensional embedding model
@@ -94,7 +113,7 @@ that is not represented as an exact-final Docker runtime test.
 The initial fresh document upload, DocReader parse, summary, embedding, MySQL
 storage, and enablement chain was executed on commit `366ec470`, before the
 final rollback and zero-threshold hardening. The stored fixture metadata keeps
-that lineage visible. The exact final binary at `57d70e42` was then used to
+that lineage visible. The exact final binary at `c5b0a356` was then used to
 rerun authenticated health checks, MySQL vector-store registration/probe,
 hybrid retrieval, CLI doctor, and grounded chat against those real stored
 chunks.
@@ -119,11 +138,11 @@ animated sequence of those four captures, not a continuous screen recording.
 
 | Artifact | SHA-256 |
 | --- | --- |
-| `live-final-head-57d70e42.png` | `89AF6EA27BE09F97813D729265C6A91A57FD6F66E7B9C5AEAC68FF0E7B239BA3` |
-| `live-mysql-runtime-57d70e42.png` | `8C2EA8840F99540193A231A57DEF5AE113D22661A0060D57F1525295BABEC975` |
-| `live-api-retrieval-57d70e42.png` | `0E84A5AB25BF26EB85C055C689A14BFD4FCD785819563378503F1E0B43F591C6` |
-| `live-cli-grounded-chat-57d70e42.png` | `68C1A99FD3991B793E420C6DAAFC528AFDAFFF682DB771F3AA04BFCE452A54DC` |
-| `live-verification-57d70e42.gif` (4 frames, 1199x616) | `031CDC8B2D289EF7893CC9A4E7B906D81AFE49A50B5B891D72E7DA993603E07A` |
+| `live-final-head-c5b0a356.png` | `0E3477B0616731DB33A5F872A0E185137886B15F06119B0DBC2B6266EA1C33FB` |
+| `live-mysql-runtime-c5b0a356.png` | `F89D2A3B6E2C200710C49C59700DDC33770153EB71D53A11030938362005F919` |
+| `live-api-retrieval-c5b0a356.png` | `08C38CB5C033F75EC32FF78D345BD8137976604C3DF459F88E1D80E0897643CA` |
+| `live-cli-grounded-chat-c5b0a356.png` | `51C9E1F416B0E9828D9117F7C8FCFCFF5BC59960AADE76929C0E3DB3C750EA01` |
+| `live-verification-c5b0a356.gif` (4 frames, 1199x616) | `D6CFFE83EE45816AD4A53C7ED74011BACECE6E093DB102053B6F80BA571DAC2A` |
 
 ## Residual limits
 
