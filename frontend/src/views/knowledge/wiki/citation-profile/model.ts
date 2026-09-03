@@ -36,8 +36,8 @@ export function graphCapNotice(
   return {
     truncated: graph.graph_truncated,
     text: graph.graph_truncated
-      ? `Graph is capped at ${maxNodes} nodes and ${maxEdges} links. Use the complete node list for all evidence.`
-      : `Graph is within the ${maxNodes} node and ${maxEdges} link cap.`,
+      ? `图谱已限制为 ${maxNodes} 个节点和 ${maxEdges} 条关系；完整证据请查看节点列表。`
+      : `图谱在 ${maxNodes} 个节点和 ${maxEdges} 条关系限制内。`,
     listUrl: graph.complete_list_url,
   }
 }

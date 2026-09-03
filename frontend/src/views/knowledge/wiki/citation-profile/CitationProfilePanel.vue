@@ -2,12 +2,12 @@
   <section class="citation-profile-panel" aria-labelledby="citation-profile-title">
     <header class="citation-profile-header">
       <div>
-        <h2 id="citation-profile-title">My source-citation evidence</h2>
-        <p>Private evidence from future committed answers after opt-in.</p>
+        <h2 id="citation-profile-title">我的引用来源证据</h2>
+        <p>仅展示开启后新回答产生的私有引用证据。</p>
       </div>
       <t-button size="small" variant="outline" :loading="loading" @click="loadAll">
         <template #icon><t-icon name="refresh" /></template>
-        Refresh
+        刷新
       </t-button>
     </header>
 
@@ -19,62 +19,62 @@
 
     <div v-if="loading && !status" class="citation-profile-empty">
       <t-loading size="small" />
-      <span>Loading evidence profile</span>
+      <span>正在加载证据画像</span>
     </div>
 
     <template v-else-if="status">
       <div v-if="emptyKind === 'feature_disabled'" class="citation-profile-empty">
         <t-icon name="error-circle" />
-        <strong>Evidence profile is off for this knowledge base.</strong>
-        <span>Ordinary Wiki behavior continues with no profile requests.</span>
+        <strong>当前知识库未开启证据画像。</strong>
+        <span>普通 Wiki 功能不受影响。</span>
       </div>
 
       <div v-else-if="emptyKind === 'acl_unknown'" class="citation-profile-empty">
         <t-icon name="error-circle" />
-        <strong>Access check is unavailable.</strong>
-        <span>Collection is suspended. You can still submit the account erasure request.</span>
+        <strong>访问检查暂不可用。</strong>
+        <span>采集已暂停，仍可提交账号清除请求。</span>
         <t-button size="small" theme="danger" variant="outline" :loading="blindDeleting" @click="blindDelete">
-          Account erasure request
+          账号清除请求
         </t-button>
       </div>
 
       <div v-else-if="!status.enrolled" class="citation-profile-empty">
         <t-icon name="file-add" />
-        <strong>Not enrolled</strong>
-        <span>Only sources cited by future committed answers after opt-in can appear here.</span>
-        <span>Exact Wiki source links may resolve to zero, one, or many pages.</span>
+        <strong>未开启</strong>
+        <span>开启后，新回答引用过的来源才会出现在这里。</span>
+        <span>同一来源可能匹配 0 个、1 个或多个 Wiki 页面。</span>
         <t-button size="small" theme="primary" :loading="enrolling" @click="setEnrollment(true)">
-          Enable my evidence profile
+          开启我的证据画像
         </t-button>
       </div>
 
       <template v-else>
         <div class="citation-profile-guidance">
           <t-icon name="info-circle" />
-          <span>There is not enough valid evidence to suggest a next learning step.</span>
+          <span>当前证据不足，仅展示证据，不生成下一步判断。</span>
         </div>
 
         <div v-if="status.snapshot && ((status.snapshot.pending_event_count || 0) || (status.snapshot.dirty_event_count || 0))"
           class="citation-profile-notice">
           <t-icon name="time" />
-          <span>{{ status.snapshot.pending_event_count || 0 }} pending, {{ status.snapshot.dirty_event_count || 0 }} stale.</span>
+          <span>{{ status.snapshot.pending_event_count || 0 }} 条待处理，{{ status.snapshot.dirty_event_count || 0 }} 条需刷新。</span>
         </div>
 
         <div v-if="emptyKind === 'no_events' || nodes.length === 0" class="citation-profile-empty">
           <t-icon name="file-unknown" />
-          <strong>No citation evidence yet</strong>
-          <span>New qualifying answer references will appear after resolution.</span>
+          <strong>暂无引用证据</strong>
+          <span>新回答产生并完成解析后会显示在这里。</span>
         </div>
 
         <template v-else>
           <div v-if="graphNotice" class="citation-profile-notice">
             <t-icon name="chart-bubble" />
             <span>{{ graphNotice.text }}</span>
-            <a href="#" @click.prevent="focusNodeList">Complete node list</a>
+            <a href="#" @click.prevent="focusNodeList">查看完整节点列表</a>
           </div>
 
           <div ref="nodeListRef" class="citation-profile-list" role="list" tabindex="-1"
-            aria-label="Complete citation evidence node list">
+            aria-label="完整引用证据节点列表">
             <button v-for="node in nodes" :key="node.page_uuid" type="button" class="citation-profile-node" role="listitem"
               :aria-label="`${node.title}: ${overlayLabel(node.overlay)}`" @click="openEvidence(node)">
               <span class="citation-profile-node-main">
@@ -83,27 +83,27 @@
               </span>
               <span class="citation-profile-node-meta">
                 <t-tag size="small" :theme="overlayTheme(node.overlay)" variant="light">{{ overlayLabel(node.overlay) }}</t-tag>
-                <span>{{ node.authorized_evidence_count }} source-reference events</span>
+                <span>{{ node.authorized_evidence_count }} 条来源引用事件</span>
               </span>
             </button>
           </div>
 
           <t-button v-if="nextCursor" size="small" variant="outline" :loading="nodesLoading" @click="loadNodes(nextCursor)">
-            Load more
+            加载更多
           </t-button>
         </template>
 
-        <div class="citation-profile-rights" aria-label="Profile rights actions">
+        <div class="citation-profile-rights" aria-label="画像数据操作">
           <t-button size="small" variant="outline" :loading="exporting" @click="startExport">
             <template #icon><t-icon name="download" /></template>
-            Export profile
+            导出画像
           </t-button>
           <t-button size="small" theme="danger" variant="outline" :loading="deleting" @click="deleteCurrent">
             <template #icon><t-icon name="delete" /></template>
-            Delete profile
+            删除画像
           </t-button>
           <t-button size="small" theme="danger" variant="text" :loading="blindDeleting" @click="blindDelete">
-            Account erasure request
+            账号清除请求
           </t-button>
         </div>
 
@@ -112,18 +112,18 @@
 
     <t-drawer v-model:visible="drawerVisible" :header="drawerTitle" size="520px" :footer="false" destroy-on-close>
       <div v-if="evidence" class="citation-profile-drawer">
-        <p class="citation-profile-claim">This answer cited a source linked to this page at resolution time.</p>
+        <p class="citation-profile-claim">这条回答在解析时引用了已关联到此页面的来源。</p>
         <dl class="citation-profile-details">
           <div>
-            <dt>Page UUID</dt>
+            <dt>页面 UUID</dt>
             <dd>{{ evidence.page.page_uuid }}</dd>
           </div>
           <div>
-            <dt>Page version</dt>
+            <dt>页面版本</dt>
             <dd>{{ evidence.page.page_version }}</dd>
           </div>
           <div>
-            <dt>Snapshot read version</dt>
+            <dt>快照读取版本</dt>
             <dd>{{ evidence.snapshot?.read_version || '0' }}</dd>
           </div>
         </dl>
@@ -131,58 +131,58 @@
         <div v-for="item in evidence.items" :key="item.event_id" class="citation-profile-evidence-item">
           <dl class="citation-profile-details">
             <div>
-              <dt>Answer occurrence time</dt>
+              <dt>回答发生时间</dt>
               <dd>{{ item.occurred_at }}</dd>
             </div>
             <div>
-              <dt>Relation resolution time</dt>
+              <dt>关系解析时间</dt>
               <dd>{{ item.resolved_at }}</dd>
             </div>
             <div>
-              <dt>Message ID</dt>
+              <dt>消息 ID</dt>
               <dd>{{ item.message_id }}</dd>
             </div>
             <div>
-              <dt>Source knowledge ID</dt>
+              <dt>来源知识 ID</dt>
               <dd>{{ item.source_knowledge_id }}</dd>
             </div>
             <div>
-              <dt>Mapping revision</dt>
+              <dt>映射版本</dt>
               <dd>{{ item.run_mapping_revision }}</dd>
             </div>
             <div>
-              <dt>Captured page version</dt>
+              <dt>采集时页面版本</dt>
               <dd>{{ item.page_version_at_resolution }}</dd>
             </div>
             <div>
-              <dt>Correction state</dt>
-              <dd>{{ item.correction_state }}</dd>
+              <dt>纠正状态</dt>
+              <dd>{{ correctionStateLabel(item.correction_state) }}</dd>
             </div>
           </dl>
 
-          <t-alert v-if="item.stale_mapping" theme="warning" message="Evidence mapping is stale; refresh before action." />
+          <t-alert v-if="item.stale_mapping" theme="warning" message="证据映射已过期，请刷新后再操作。" />
 
           <div class="citation-profile-corrections">
             <t-select v-model="reasonCode" size="small" class="citation-profile-reason">
-              <t-option value="wrong_page" label="Wrong page" />
-              <t-option value="stale_mapping" label="Stale mapping" />
-              <t-option value="other" label="Other" />
+              <t-option value="wrong_page" label="页面不匹配" />
+              <t-option value="stale_mapping" label="映射已过期" />
+              <t-option value="other" label="其他" />
             </t-select>
             <t-button size="small" :disabled="isActionBlocked" @click="correct(item, 'confirm_relevant')">
-              Confirm this mapping
+              确认这个映射
             </t-button>
             <t-button size="small" theme="warning" variant="outline" :disabled="isActionBlocked" @click="correct(item, 'reject_mapping')">
-              Reject this mapping
+              拒绝这个映射
             </t-button>
             <t-button size="small" theme="danger" variant="outline" :disabled="isActionBlocked" @click="correct(item, 'retract_event')">
-              Retract this source event
+              撤回这条来源事件
             </t-button>
           </div>
         </div>
 
         <t-button v-if="evidence.next_cursor" size="small" variant="outline" :loading="evidenceLoading"
           @click="loadEvidencePage(evidence.page.page_uuid, evidence.next_cursor)">
-          Load more evidence
+          加载更多证据
         </t-button>
       </div>
     </t-drawer>
@@ -229,7 +229,7 @@ const reasonCode = ref('wrong_page')
 const operationReceipt = ref('')
 
 const emptyKind = computed(() => status.value?.empty_state?.kind)
-const drawerTitle = computed(() => evidence.value?.page.title || selectedNode.value?.title || 'Evidence')
+const drawerTitle = computed(() => evidence.value?.page.title || selectedNode.value?.title || '证据详情')
 const graphNotice = computed(() => graph.value ? graphCapNotice(graph.value) : null)
 const currentReadVersion = computed(() => status.value?.snapshot?.read_version || evidence.value?.snapshot?.read_version || null)
 const evidenceReadVersion = computed(() => evidence.value?.snapshot?.read_version || null)
@@ -252,7 +252,7 @@ async function loadAll() {
       await Promise.all([loadNodes(null), loadGraph()])
     }
   } catch (error: any) {
-    errorMessage.value = error?.message || 'Evidence profile is unavailable.'
+    errorMessage.value = error?.message || '证据画像暂不可用。'
   } finally {
     loading.value = false
   }
@@ -286,7 +286,7 @@ async function setEnrollment(enabled: boolean) {
     })
     await loadAll()
   } catch (error: any) {
-    MessagePlugin.error(error?.message || 'Enrollment update failed.')
+    MessagePlugin.error(error?.message || '开启状态更新失败。')
   } finally {
     enrolling.value = false
   }
@@ -310,7 +310,7 @@ async function loadEvidencePage(pageUuid: string, cursor: string | null) {
       ? { ...page, items: [...evidence.value.items, ...page.items] }
       : page
   } catch (error: any) {
-    MessagePlugin.error(error?.message || 'Evidence load failed.')
+    MessagePlugin.error(error?.message || '证据加载失败。')
   } finally {
     evidenceLoading.value = false
   }
@@ -333,13 +333,13 @@ async function correct(item: CitationProfileEvidenceItem, action: CitationProfil
     if (drawerVisible.value) {
       await loadEvidencePage(pageUuid, null)
     }
-    MessagePlugin.success('Correction applied.')
+    MessagePlugin.success('纠正已记录。')
   } catch (error: any) {
     if (error?.code === 'profile_changed' || error?.status === 409) {
-      MessagePlugin.warning('Evidence changed. Refresh and review again.')
+      MessagePlugin.warning('证据已变化，请刷新后再确认。')
       return
     }
-    MessagePlugin.error(error?.message || 'Correction failed.')
+    MessagePlugin.error(error?.message || '纠正失败。')
   }
 }
 
@@ -352,15 +352,15 @@ async function startExport() {
       format: 'json',
     }))
     operationReceipt.value = result.status === 'ready'
-      ? 'Export is ready for reauthorized download.'
-      : 'Export is preparing and expires in one hour.'
+      ? '导出已准备好，请重新授权下载。'
+      : '导出正在准备，将在一小时后过期。'
     if (result.status === 'ready') {
       const blob = await citationProfileClient.downloadExport(props.knowledgeBaseId, result.operation_id)
       saveExportBlob(blob, result.operation_id)
-      operationReceipt.value = 'Export downloaded.'
+      operationReceipt.value = '导出已下载。'
     }
   } catch (error: any) {
-    MessagePlugin.error(error?.message || 'Export failed.')
+    MessagePlugin.error(error?.message || '导出失败。')
   } finally {
     exporting.value = false
   }
@@ -376,10 +376,10 @@ async function deleteCurrent() {
     drawerVisible.value = false
     nodes.value = []
     graph.value = null
-    operationReceipt.value = 'Profile hidden immediately; active-plane purge scheduled.'
+    operationReceipt.value = '画像已隐藏，后续清理已安排。'
     await loadAll()
   } catch (error: any) {
-    MessagePlugin.error(error?.message || 'Delete request failed.')
+    MessagePlugin.error(error?.message || '删除请求失败。')
   } finally {
     deleting.value = false
   }
@@ -392,9 +392,9 @@ async function blindDelete() {
     drawerVisible.value = false
     nodes.value = []
     graph.value = null
-    operationReceipt.value = 'Request accepted.'
+    operationReceipt.value = '请求已受理。'
   } catch (error: any) {
-    MessagePlugin.error(error?.message || 'Request failed.')
+    MessagePlugin.error(error?.message || '请求失败。')
   } finally {
     blindDeleting.value = false
   }
@@ -416,16 +416,29 @@ function focusNodeList() {
   nodeListRef.value?.focus()
 }
 
+function correctionStateLabel(state: CitationProfileEvidenceItem['correction_state']): string {
+  switch (state) {
+    case 'confirmed':
+      return '已确认'
+    case 'rejected':
+      return '已拒绝'
+    case 'event_retracted':
+      return '已撤回'
+    default:
+      return '未纠正'
+  }
+}
+
 function overlayLabel(overlay: CitationProfileNode['overlay']): string {
   switch (overlay) {
     case 'evidenced_current':
-      return 'Current-version source evidence'
+      return '当前版本有来源证据'
     case 'evidenced_historical':
-      return 'Earlier-version source evidence'
+      return '历史版本来源证据'
     case 'disputed':
-      return 'You disputed this mapping'
+      return '你已质疑此映射'
     default:
-      return 'No citation evidence'
+      return '暂无引用证据'
   }
 }
 
