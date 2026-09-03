@@ -169,7 +169,7 @@ func ParseSQL(sql string) *SQLParseResult {
 	}
 
 	// Parse the SQL using pg_query_go
-	parseResult, err := pg_query.Parse(sql)
+	parseResult, err := pgQueryParseSQL(sql)
 	if err != nil {
 		result.IsSelect = false
 		result.ParseError = fmt.Sprintf("Failed to parse SQL: %v", err)
@@ -727,7 +727,7 @@ func ValidateSQL(sql string, opts ...SQLValidationOption) (*SQLParseResult, *SQL
 	}
 
 	// Phase 2: Parse SQL using PostgreSQL's official parser
-	parseResult, err := pg_query.Parse(sql)
+	parseResult, err := pgQueryParseSQL(sql)
 	if err != nil {
 		validationResult.Valid = false
 		validationResult.Errors = append(validationResult.Errors, SQLValidationError{
@@ -875,13 +875,13 @@ func ValidateAndSecureSQL(sql string, opts ...SQLValidationOption) (string, *SQL
 	}
 
 	// Parse again to get normalized SQL
-	result, err := pg_query.Parse(sql)
+	result, err := pgQueryParseSQL(sql)
 	if err != nil {
 		return "", validationResult, fmt.Errorf("failed to parse SQL: %v", err)
 	}
 
 	// Normalize SQL
-	normalizedSQL, err := pg_query.Deparse(result)
+	normalizedSQL, err := pgQueryDeparseSQL(result)
 	if err != nil {
 		return "", validationResult, fmt.Errorf("failed to normalize SQL: %v", err)
 	}

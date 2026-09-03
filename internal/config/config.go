@@ -17,22 +17,23 @@ import (
 
 // Config 应用程序总配置
 type Config struct {
-	Conversation    *ConversationConfig    `yaml:"conversation"     json:"conversation"`
-	Server          *ServerConfig          `yaml:"server"           json:"server"`
-	KnowledgeBase   *KnowledgeBaseConfig   `yaml:"knowledge_base"   json:"knowledge_base"`
-	Tenant          *TenantConfig          `yaml:"tenant"           json:"tenant"`
-	Auth            *AuthConfig            `yaml:"auth"             json:"auth"`
-	Audit           *AuditConfig           `yaml:"audit"            json:"audit"`
-	OIDCAuth        *OIDCAuthConfig        `yaml:"oidc_auth"        json:"oidc_auth"`
-	Models          []ModelConfig          `yaml:"models"           json:"models"`
-	VectorDatabase  *VectorDatabaseConfig  `yaml:"vector_database"  json:"vector_database"`
-	DocReader       *DocReaderConfig       `yaml:"docreader"        json:"docreader"`
-	StreamManager   *StreamManagerConfig   `yaml:"stream_manager"   json:"stream_manager"`
-	ExtractManager  *ExtractManagerConfig  `yaml:"extract"          json:"extract"`
-	WebSearch       *WebSearchConfig       `yaml:"web_search"       json:"web_search"`
-	PromptTemplates *PromptTemplatesConfig `yaml:"prompt_templates" json:"prompt_templates"`
-	IM              *IMConfig              `yaml:"im"               json:"im"`
-	Agent           *AgentConfig           `yaml:"agent"            json:"agent"`
+	Conversation    *ConversationConfig          `yaml:"conversation"     json:"conversation"`
+	Server          *ServerConfig                `yaml:"server"           json:"server"`
+	KnowledgeBase   *KnowledgeBaseConfig         `yaml:"knowledge_base"   json:"knowledge_base"`
+	CitationProfile *types.CitationProfileConfig `yaml:"citation_profile" json:"citation_profile"`
+	Tenant          *TenantConfig                `yaml:"tenant"           json:"tenant"`
+	Auth            *AuthConfig                  `yaml:"auth"             json:"auth"`
+	Audit           *AuditConfig                 `yaml:"audit"            json:"audit"`
+	OIDCAuth        *OIDCAuthConfig              `yaml:"oidc_auth"        json:"oidc_auth"`
+	Models          []ModelConfig                `yaml:"models"           json:"models"`
+	VectorDatabase  *VectorDatabaseConfig        `yaml:"vector_database"  json:"vector_database"`
+	DocReader       *DocReaderConfig             `yaml:"docreader"        json:"docreader"`
+	StreamManager   *StreamManagerConfig         `yaml:"stream_manager"   json:"stream_manager"`
+	ExtractManager  *ExtractManagerConfig        `yaml:"extract"          json:"extract"`
+	WebSearch       *WebSearchConfig             `yaml:"web_search"       json:"web_search"`
+	PromptTemplates *PromptTemplatesConfig       `yaml:"prompt_templates" json:"prompt_templates"`
+	IM              *IMConfig                    `yaml:"im"               json:"im"`
+	Agent           *AgentConfig                 `yaml:"agent"            json:"agent"`
 	// FrontendBaseURL is the externally-visible origin of the SPA, used
 	// to compose absolute share-link URLs. Empty falls back to a host-
 	// relative URL ("/register?token=…") which the SPA then resolves
@@ -582,6 +583,7 @@ func LoadConfig() (*Config, error) {
 	applyOIDCEnvOverrides(&cfg)
 	applyAgentEnvOverrides(&cfg)
 	applyKnowledgeBaseEnvOverrides(&cfg)
+	applyCitationProfileDefaults(&cfg)
 	applyAuthAndTenantDefaults(&cfg)
 	applyAuditDefaults(&cfg)
 
@@ -793,6 +795,20 @@ func applyAgentEnvOverrides(cfg *Config) {
 		} else if d, err := time.ParseDuration(value + "s"); err == nil {
 			cfg.Agent.ToolApprovalTimeoutSeconds = int(d.Seconds())
 		}
+	}
+}
+
+func applyCitationProfileDefaults(cfg *Config) {
+	if cfg.CitationProfile == nil {
+		cfg.CitationProfile = &types.CitationProfileConfig{}
+	}
+	if value := strings.TrimSpace(os.Getenv("WEKNORA_CITATION_PROFILE_ENABLED")); value != "" {
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			fmt.Printf("[config] WEKNORA_CITATION_PROFILE_ENABLED=%q is not a boolean, ignoring\n", value)
+			return
+		}
+		cfg.CitationProfile.Enabled = parsed
 	}
 }
 

@@ -20,6 +20,8 @@ const (
 	PrincipalContextKey ContextKey = "Principal"
 	// TenantAPIKeyScopeContextKey carries per-API-key operation and KB scopes.
 	TenantAPIKeyScopeContextKey ContextKey = "TenantAPIKeyScope"
+	// AuthIssuedAtContextKey carries the verified web access token iat for recent-auth guards.
+	AuthIssuedAtContextKey ContextKey = "AuthIssuedAt"
 	// TenantRoleContextKey is the context key for the caller's TenantRole
 	// in the currently active tenant (loaded by the auth middleware from
 	// the tenant_members table). See TenantRoleFromContext.

@@ -1434,7 +1434,9 @@ func (h *Handler) completeAssistantMessage(
 ) {
 	assistantMessage.UpdatedAt = time.Now()
 	assistantMessage.IsCompleted = true
-	_ = h.messageService.UpdateMessage(ctx, assistantMessage)
+	if !h.persistCompletedAssistantMessage(ctx, assistantMessage) {
+		return
+	}
 
 	// Asynchronously index the Q&A pair into the chat history knowledge base for vector search.
 	// Use WithoutCancel so the goroutine survives after the HTTP request context is done.
@@ -1452,6 +1454,24 @@ func (h *Handler) completeAssistantMessage(
 	if userQuery != "" {
 		go h.recordTurnMemory(bgCtx, assistantMessage, userQuery, userMessageID)
 	}
+}
+
+func (h *Handler) persistCompletedAssistantMessage(ctx context.Context, assistantMessage *types.Message) bool {
+	if h.citationProfileService != nil {
+		handled, err := h.citationProfileService.CompleteAssistantMessage(ctx, assistantMessage)
+		if err != nil {
+			logger.Warnf(ctx, "citation profile: complete assistant message failed for %s: %v", assistantMessage.ID, err)
+			return false
+		}
+		if handled {
+			return true
+		}
+	}
+	if err := h.messageService.UpdateMessage(ctx, assistantMessage); err != nil {
+		logger.Warnf(ctx, "complete assistant message failed for %s: %v", assistantMessage.ID, err)
+		return false
+	}
+	return true
 }
 
 // recordTurnMemory runs the long-term memory write path for a finished turn.

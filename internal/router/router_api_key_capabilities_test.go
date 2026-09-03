@@ -329,6 +329,58 @@ func TestKnowledgeReadRoutesDeclareRetrieveCapability(t *testing.T) {
 	}
 }
 
+func TestCitationProfileRoutesSplitReadAndPrivilegedOperations(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	g := &rbacGuards{}
+	v1 := gin.New().Group("/api/v1")
+
+	RegisterCitationProfileRoutes(v1, &handler.CitationProfileHandler{}, g)
+
+	readCases := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/api/v1/knowledgebase/:kb_id/citation-profile/status"},
+		{http.MethodGet, "/api/v1/knowledgebase/:kb_id/citation-profile/nodes"},
+		{http.MethodGet, "/api/v1/knowledgebase/:kb_id/citation-profile/graph"},
+		{http.MethodGet, "/api/v1/knowledgebase/:kb_id/citation-profile/nodes/:page_uuid/evidence"},
+	}
+	for _, tc := range readCases {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			policy := mustLookupAPIKeyPolicy(t, g, tc.method, tc.path)
+			if !policy.RequireFullAccess {
+				t.Fatal("citation profile read routes should require full access without a matching capability")
+			}
+			if !policyHasCapability(policy, types.APIKeyCapabilityRetrieve) {
+				t.Fatalf("policy capabilities = %#v, want retrieve", policy.Capabilities)
+			}
+		})
+	}
+
+	privilegedCases := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPost, "/api/v1/knowledgebase/:kb_id/citation-profile/corrections"},
+		{http.MethodPut, "/api/v1/knowledgebase/:kb_id/citation-profile/enrollment"},
+		{http.MethodPost, "/api/v1/knowledgebase/:kb_id/citation-profile/exports"},
+		{http.MethodGet, "/api/v1/knowledgebase/:kb_id/citation-profile/exports/:operation_id"},
+		{http.MethodGet, "/api/v1/knowledgebase/:kb_id/citation-profile/exports/:operation_id/download"},
+		{http.MethodDelete, "/api/v1/knowledgebase/:kb_id/citation-profile"},
+		{http.MethodDelete, "/api/v1/citation-profile/scopes/:kb_id"},
+	}
+	for _, tc := range privilegedCases {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			policy := mustLookupAPIKeyPolicy(t, g, tc.method, tc.path)
+			if !policy.RequireFullAccess {
+				t.Fatal("citation profile privileged route should require full access")
+			}
+			if policyHasCapability(policy, types.APIKeyCapabilityRetrieve) {
+				t.Fatalf("privileged route must not be granted by retrieve: %#v", policy.Capabilities)
+			}
+		})
+	}
+}
 func TestTenantInfrastructureRoutesDeclareSpecificCapabilities(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	g := &rbacGuards{}

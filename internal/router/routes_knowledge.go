@@ -332,3 +332,25 @@ func RegisterWikiPageRoutes(r *gin.RouterGroup, wikiHandler *handler.WikiPageHan
 		wiki.PUT("/issues/:issue_id/status", g.OwnedWikiKBOrAdmin(), g.KBAccessWrite("kb_id"), wikiHandler.UpdateIssueStatus)
 	}
 }
+
+// RegisterCitationProfileRoutes registers Topic 4 citation profile endpoints.
+func RegisterCitationProfileRoutes(r *gin.RouterGroup, profileHandler *handler.CitationProfileHandler, g *rbacGuards) {
+	if profileHandler == nil {
+		return
+	}
+	profile := g.apiKeyGroup(r.Group("/knowledgebase/:kb_id/citation-profile"), apiKeyFullAccess())
+	profileRead := profile.With(apiKeyRetrieve(apiKeyFullAccess()))
+	profileWrite := profile.With(apiKeyFullAccess())
+	sensitive := citationProfileSensitiveOperationGuard()
+	profileRead.GET("/status", g.Viewer(), g.KBAccessRead("kb_id"), profileHandler.GetStatus)
+	profileRead.GET("/nodes", g.Viewer(), g.KBAccessRead("kb_id"), profileHandler.ListNodes)
+	profileRead.GET("/graph", g.Viewer(), g.KBAccessRead("kb_id"), profileHandler.GetGraph)
+	profileRead.GET("/nodes/:page_uuid/evidence", g.Viewer(), g.KBAccessRead("kb_id"), profileHandler.ListNodeEvidence)
+	profileWrite.POST("/corrections", sensitive, g.Viewer(), g.KBAccessRead("kb_id"), profileHandler.ApplyCorrection)
+	profileWrite.PUT("/enrollment", sensitive, g.Viewer(), g.KBAccessRead("kb_id"), profileHandler.SetEnrollment)
+	profileWrite.POST("/exports", sensitive, g.Viewer(), g.KBAccessRead("kb_id"), profileHandler.CreateExport)
+	profileWrite.GET("/exports/:operation_id", sensitive, g.Viewer(), g.KBAccessRead("kb_id"), profileHandler.GetExport)
+	profileWrite.GET("/exports/:operation_id/download", sensitive, g.Viewer(), g.KBAccessRead("kb_id"), profileHandler.DownloadExport)
+	profileWrite.DELETE("/", sensitive, g.Viewer(), g.KBAccessRead("kb_id"), profileHandler.DeleteCurrentScope)
+	g.apiKeyRoute(r, http.MethodDelete, "/citation-profile/scopes/:kb_id", apiKeyFullAccess(), sensitive, g.Viewer(), profileHandler.DeleteBlindScope)
+}

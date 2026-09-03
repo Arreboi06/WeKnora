@@ -149,7 +149,7 @@ func Auth(
 			bearerPresented = true
 			user, jwtTenantID, err := userService.ValidateToken(c.Request.Context(), token)
 			if err == nil && user != nil {
-				if authenticateJWTUser(c, tenantService, memberService, cfg, user, jwtTenantID) {
+				if authenticateJWTUser(c, tenantService, memberService, cfg, user, jwtTenantID, authTokenIssuedAt(token)) {
 					c.Next()
 				}
 				return
@@ -189,6 +189,40 @@ func bearerToken(c *gin.Context) (string, bool) {
 	return strings.TrimPrefix(authHeader, "Bearer "), true
 }
 
+func authTokenIssuedAt(tokenString string) *time.Time {
+	claims := jwt.MapClaims{}
+	if _, _, err := jwt.NewParser().ParseUnverified(tokenString, claims); err != nil {
+		return nil
+	}
+	issuedAt, ok := authIssuedAtFromClaims(claims)
+	if !ok {
+		return nil
+	}
+	return &issuedAt
+}
+
+func authIssuedAtFromClaims(claims jwt.MapClaims) (time.Time, bool) {
+	raw, ok := claims["iat"]
+	if !ok {
+		return time.Time{}, false
+	}
+	var unix int64
+	switch value := raw.(type) {
+	case float64:
+		unix = int64(value)
+	case int64:
+		unix = value
+	case int:
+		unix = int64(value)
+	default:
+		return time.Time{}, false
+	}
+	if unix <= 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(unix, 0).UTC(), true
+}
+
 // authenticateJWTUser finishes authentication for a validated JWT user:
 // it resolves the target tenant (X-Tenant-ID switch / JWT claim / first
 // active membership), resolves the caller's role inside that tenant, and
@@ -201,6 +235,7 @@ func authenticateJWTUser(
 	cfg *config.Config,
 	user *types.User,
 	jwtTenantID uint64,
+	authIssuedAt *time.Time,
 ) bool {
 	ctx := c.Request.Context()
 
@@ -256,12 +291,13 @@ func authenticateJWTUser(
 		"[auth] resolved role=%s for user=%s in tenant=%d (jwt_tenant=%d, header=%q, cross_switch=%v)",
 		role, user.ID, targetTenantID, jwtTenantID, c.GetHeader("X-Tenant-ID"), crossTenantSwitch)
 	applyAuthSession(c, authSession{
-		User:        user,
-		Principal:   types.Principal{Type: types.PrincipalWebUser, ID: user.ID},
-		TenantID:    targetTenantID,
-		Tenant:      tenant,
-		Role:        role,
-		SystemAdmin: user.IsSystemAdmin,
+		User:         user,
+		Principal:    types.Principal{Type: types.PrincipalWebUser, ID: user.ID},
+		TenantID:     targetTenantID,
+		Tenant:       tenant,
+		Role:         role,
+		SystemAdmin:  user.IsSystemAdmin,
+		AuthIssuedAt: authIssuedAt,
 	})
 	return true
 }

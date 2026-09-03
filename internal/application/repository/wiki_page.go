@@ -10,6 +10,7 @@ import (
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -44,9 +45,14 @@ func (r *wikiPageRepository) wikiEmptyInLinksPredicate() string {
 	return "(in_links IS NULL OR in_links = '[]'::JSONB)"
 }
 
-// Create inserts a new wiki page record
+// Create inserts a new wiki page record.
 func (r *wikiPageRepository) Create(ctx context.Context, page *types.WikiPage) error {
-	return r.db.WithContext(ctx).Create(page).Error
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(page).Error; err != nil {
+			return err
+		}
+		return syncWikiSourceRefIndexForPage(tx, page)
+	})
 }
 
 // Update updates an existing wiki page record with optimistic locking.
@@ -59,7 +65,9 @@ func (r *wikiPageRepository) Create(ctx context.Context, page *types.WikiPage) e
 // map call *did* write empty status — one inconsistent half-update. The map
 // covers every column UpdatePage mutates, so no UpdateMeta chaser is needed.
 func (r *wikiPageRepository) Update(ctx context.Context, page *types.WikiPage) error {
-	return updateWikiPageRow(r.db.WithContext(ctx), page)
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return updateWikiPageRow(tx, page)
+	})
 }
 
 // UpdateWithRevision snapshots the version being superseded and applies the
@@ -132,7 +140,312 @@ func updateWikiPageRow(db *gorm.DB, page *types.WikiPage) error {
 		}
 		return ErrWikiPageConflict
 	}
+	if err := syncWikiSourceRefIndexForPage(db, page); err != nil {
+		return err
+	}
+	return markCitationProfileMappingsDirtyForPage(db, page, page.UpdatedAt.UTC())
+}
+
+func syncWikiSourceRefIndexForPage(db *gorm.DB, page *types.WikiPage) error {
+	if page == nil || strings.TrimSpace(page.ID) == "" || strings.TrimSpace(page.KnowledgeBaseID) == "" {
+		return nil
+	}
+	now := page.UpdatedAt.UTC()
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if err := db.Model(&types.WikiSourceRefIndex{}).
+		Where("tenant_id = ? AND knowledge_base_id = ? AND page_uuid = ? AND lifecycle_state = ? AND page_version <> ?",
+			page.TenantID, page.KnowledgeBaseID, page.ID, "current", page.Version).
+		Updates(map[string]interface{}{
+			"lifecycle_state": "historical",
+			"updated_at":      now,
+		}).Error; err != nil {
+		return err
+	}
+	if err := db.Where(
+		"tenant_id = ? AND knowledge_base_id = ? AND page_uuid = ? AND lifecycle_state = ? AND page_version = ?",
+		page.TenantID, page.KnowledgeBaseID, page.ID, "current", page.Version,
+	).Delete(&types.WikiSourceRefIndex{}).Error; err != nil {
+		return err
+	}
+	if page.Status == types.WikiPageStatusArchived || page.DeletedAt.Valid {
+		return nil
+	}
+
+	rows := make([]types.WikiSourceRefIndex, 0, len(page.SourceRefs))
+	seen := make(map[string]struct{}, len(page.SourceRefs))
+	mappingRevision := uint64(page.Version)
+	watermark := wikiSourceRefIndexWatermark(page, now)
+	for _, rawRef := range page.SourceRefs {
+		sourceKnowledgeID := types.WikiSourceKnowledgeID(rawRef)
+		if sourceKnowledgeID == "" {
+			continue
+		}
+		if _, ok := seen[sourceKnowledgeID]; ok {
+			continue
+		}
+		seen[sourceKnowledgeID] = struct{}{}
+		rows = append(rows, types.WikiSourceRefIndex{
+			ID:                uuid.NewString(),
+			TenantID:          page.TenantID,
+			KnowledgeBaseID:   page.KnowledgeBaseID,
+			SourceKnowledgeID: sourceKnowledgeID,
+			PageUUID:          page.ID,
+			PageVersion:       page.Version,
+			PageSlug:          page.Slug,
+			PageTitle:         page.Title,
+			NormalizedRef:     sourceKnowledgeID,
+			MappingRevision:   mappingRevision,
+			LifecycleState:    "current",
+			IndexWatermark:    watermark,
+			IndexedAt:         now,
+			CreatedAt:         now,
+			UpdatedAt:         now,
+		})
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	return db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{
+			{Name: "tenant_id"},
+			{Name: "knowledge_base_id"},
+			{Name: "source_knowledge_id"},
+			{Name: "page_uuid"},
+			{Name: "page_version"},
+			{Name: "normalized_ref"},
+			{Name: "mapping_revision"},
+			{Name: "lifecycle_state"},
+		},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"page_slug",
+			"page_title",
+			"index_watermark",
+			"indexed_at",
+			"updated_at",
+		}),
+	}).Create(&rows).Error
+}
+
+func markWikiSourceRefIndexPageDeleted(db *gorm.DB, page *types.WikiPage) error {
+	if page == nil || strings.TrimSpace(page.ID) == "" || strings.TrimSpace(page.KnowledgeBaseID) == "" {
+		return nil
+	}
+	now := time.Now().UTC()
+	return db.Model(&types.WikiSourceRefIndex{}).
+		Where("tenant_id = ? AND knowledge_base_id = ? AND page_uuid = ? AND lifecycle_state = ?",
+			page.TenantID, page.KnowledgeBaseID, page.ID, "current").
+		Updates(map[string]interface{}{
+			"lifecycle_state": "deleted",
+			"updated_at":      now,
+		}).Error
+}
+
+func markCitationProfileMappingsDirtyForPage(db *gorm.DB, page *types.WikiPage, changedAt time.Time) error {
+	if page == nil || strings.TrimSpace(page.ID) == "" || strings.TrimSpace(page.KnowledgeBaseID) == "" {
+		return nil
+	}
+	now := changedAt.UTC()
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	var currentRefs []types.WikiSourceRefIndex
+	if err := db.Where(
+		"tenant_id = ? AND knowledge_base_id = ? AND page_uuid = ? AND lifecycle_state = ?",
+		page.TenantID,
+		page.KnowledgeBaseID,
+		page.ID,
+		"current",
+	).Find(&currentRefs).Error; err != nil {
+		return err
+	}
+	currentKeys := make(map[citationProfileSourceRefKey]struct{}, len(currentRefs))
+	for _, ref := range currentRefs {
+		currentKeys[citationProfileSourceRefKeyFromIndex(ref)] = struct{}{}
+	}
+
+	var links []types.EvidenceNodeLink
+	if err := db.Where(
+		"tenant_id = ? AND knowledge_base_id = ? AND page_uuid = ? AND relation_state = ?",
+		page.TenantID,
+		page.KnowledgeBaseID,
+		page.ID,
+		types.EvidenceRelationCurrent,
+	).Find(&links).Error; err != nil {
+		return err
+	}
+	if len(links) == 0 {
+		return nil
+	}
+
+	staleLinkIDs := make([]string, 0, len(links))
+	eventIDs := make([]string, 0, len(links))
+	eventLinkCounts := make(map[string]int, len(links))
+	seenEvents := make(map[string]struct{}, len(links))
+	for _, link := range links {
+		if _, ok := currentKeys[citationProfileSourceRefKeyFromLink(link)]; ok {
+			continue
+		}
+		staleLinkIDs = append(staleLinkIDs, link.ID)
+		eventLinkCounts[link.EventID]++
+		if _, ok := seenEvents[link.EventID]; ok {
+			continue
+		}
+		seenEvents[link.EventID] = struct{}{}
+		eventIDs = append(eventIDs, link.EventID)
+	}
+	if len(staleLinkIDs) == 0 {
+		return nil
+	}
+	if err := db.Model(&types.EvidenceNodeLink{}).
+		Where("id IN ?", staleLinkIDs).
+		Update("relation_state", types.EvidenceRelationHistorical).Error; err != nil {
+		return err
+	}
+
+	var events []types.CitationProfileEvent
+	if err := db.Where(
+		"tenant_id = ? AND knowledge_base_id = ? AND id IN ? AND retracted_at IS NULL",
+		page.TenantID,
+		page.KnowledgeBaseID,
+		eventIDs,
+	).Find(&events).Error; err != nil {
+		return err
+	}
+	if len(events) == 0 {
+		return nil
+	}
+
+	scopeIDs := make([]string, 0, len(events))
+	seenScopes := make(map[string]struct{}, len(events))
+	for _, event := range events {
+		if _, ok := seenScopes[event.ScopeID]; ok {
+			continue
+		}
+		seenScopes[event.ScopeID] = struct{}{}
+		scopeIDs = append(scopeIDs, event.ScopeID)
+	}
+	var scopes []types.CitationProfileScope
+	if err := db.Where(
+		"tenant_id = ? AND knowledge_base_id = ? AND id IN ? AND enabled = ? AND deleted_at IS NULL AND fenced_at IS NULL",
+		page.TenantID,
+		page.KnowledgeBaseID,
+		scopeIDs,
+		true,
+	).Find(&scopes).Error; err != nil {
+		return err
+	}
+	currentScopes := make(map[string]struct{}, len(scopes))
+	for i := range scopes {
+		if citationProfileScopeACLCurrent(&scopes[i]) {
+			currentScopes[scopes[i].ID] = struct{}{}
+		}
+	}
+	selectedEventIDs := make([]string, 0, len(events))
+	pendingDeltas := make(map[string]int, len(scopes))
+	dirtyDeltas := make(map[string]int, len(scopes))
+	selectedEvents := make([]types.CitationProfileEvent, 0, len(events))
+	for _, event := range events {
+		if _, ok := currentScopes[event.ScopeID]; !ok {
+			continue
+		}
+		selectedEventIDs = append(selectedEventIDs, event.ID)
+		selectedEvents = append(selectedEvents, event)
+		dirtyDeltas[event.ScopeID] += eventLinkCounts[event.ID]
+		if event.Status != types.CitationProfileEventStatusPendingResolution {
+			pendingDeltas[event.ScopeID]++
+		}
+	}
+	if len(selectedEventIDs) == 0 {
+		return nil
+	}
+
+	if err := db.Model(&types.CitationProfileEvent{}).
+		Where("tenant_id = ? AND knowledge_base_id = ? AND id IN ?", page.TenantID, page.KnowledgeBaseID, selectedEventIDs).
+		Updates(map[string]interface{}{
+			"status":         types.CitationProfileEventStatusPendingResolution,
+			"active_run_id":  "",
+			"resolved_at":    nil,
+			"pending_reason": "wiki_source_ref_drift",
+			"failed_reason":  "",
+			"updated_at":     now,
+		}).Error; err != nil {
+		return err
+	}
+	if err := db.Model(&types.CitationProfileEventOutbox{}).
+		Where("event_id IN ? AND deadletter_at IS NULL", selectedEventIDs).
+		Updates(map[string]interface{}{
+			"status":             types.CitationProfileOutboxStatusPending,
+			"next_attempt_at":    now,
+			"locked_at":          nil,
+			"locked_by":          "",
+			"delivered_at":       nil,
+			"last_error_code":    "",
+			"last_error_message": "",
+			"updated_at":         now,
+		}).Error; err != nil {
+		return err
+	}
+
+	var existingOutbox []struct{ EventID string }
+	if err := db.Model(&types.CitationProfileEventOutbox{}).
+		Select("event_id").
+		Where("event_id IN ? AND deadletter_at IS NULL", selectedEventIDs).
+		Find(&existingOutbox).Error; err != nil {
+		return err
+	}
+	hasOutbox := make(map[string]struct{}, len(existingOutbox))
+	for _, row := range existingOutbox {
+		hasOutbox[row.EventID] = struct{}{}
+	}
+	missingOutbox := make([]types.CitationProfileEventOutbox, 0)
+	for _, event := range selectedEvents {
+		if _, ok := hasOutbox[event.ID]; ok {
+			continue
+		}
+		missingOutbox = append(missingOutbox, types.CitationProfileEventOutbox{
+			ID:              uuid.NewString(),
+			TenantID:        event.TenantID,
+			SubjectID:       event.SubjectID,
+			KnowledgeBaseID: event.KnowledgeBaseID,
+			SubjectEpoch:    event.SubjectEpoch,
+			ScopeID:         event.ScopeID,
+			EventID:         event.ID,
+			Status:          types.CitationProfileOutboxStatusPending,
+			NextAttemptAt:   now,
+			CreatedAt:       now,
+			UpdatedAt:       now,
+		})
+	}
+	if len(missingOutbox) > 0 {
+		if err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&missingOutbox).Error; err != nil {
+			return err
+		}
+	}
+
+	watermark := citationTrim(fmt.Sprintf("wiki_source_ref_drift:%s:%s", page.ID, now.Format(time.RFC3339Nano)), 128)
+	for scopeID, dirtyDelta := range dirtyDeltas {
+		if dirtyDelta == 0 {
+			continue
+		}
+		if err := db.Model(&types.CitationProfileScope{}).
+			Where("tenant_id = ? AND knowledge_base_id = ? AND id = ?", page.TenantID, page.KnowledgeBaseID, scopeID).
+			Updates(map[string]interface{}{
+				"profile_read_version":      gorm.Expr("profile_read_version + 1"),
+				"mapping_revision":          gorm.Expr("mapping_revision + 1"),
+				"source_universe_watermark": watermark,
+				"dirty_mapping_count":       gorm.Expr("dirty_mapping_count + ?", dirtyDelta),
+				"pending_event_count":       gorm.Expr("pending_event_count + ?", pendingDeltas[scopeID]),
+				"updated_at":                now,
+			}).Error; err != nil {
+			return err
+		}
+	}
 	return nil
+}
+func wikiSourceRefIndexWatermark(page *types.WikiPage, indexedAt time.Time) string {
+	return fmt.Sprintf("page:%s:v%d:%s", page.ID, page.Version, indexedAt.Format(time.RFC3339Nano))
 }
 
 // wikiRevisionListColumns is the projection for revision listings — every
@@ -251,32 +564,37 @@ func (r *wikiPageRepository) UpdateAutoLinkedContent(ctx context.Context, page *
 //
 // Used by link maintenance, re-ingest (same-content case), and status changes.
 func (r *wikiPageRepository) UpdateMeta(ctx context.Context, page *types.WikiPage) error {
-	result := r.db.WithContext(ctx).
-		Model(page).
-		Where("id = ?", page.ID).
-		Updates(map[string]interface{}{
-			"in_links":      page.InLinks,
-			"out_links":     page.OutLinks,
-			"aliases":       page.Aliases,
-			"status":        page.Status,
-			"source_refs":   page.SourceRefs,
-			"chunk_refs":    page.ChunkRefs,
-			"page_metadata": page.PageMetadata,
-			"parent_slug":   page.ParentSlug,
-			"folder_id":     page.FolderID,
-			"category_path": page.CategoryPath,
-			"wiki_path":     page.WikiPath,
-			"depth":         page.Depth,
-			"sort_order":    page.SortOrder,
-			"updated_at":    page.UpdatedAt,
-		})
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		return ErrWikiPageNotFound
-	}
-	return nil
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.
+			Model(page).
+			Where("id = ?", page.ID).
+			Updates(map[string]interface{}{
+				"in_links":      page.InLinks,
+				"out_links":     page.OutLinks,
+				"aliases":       page.Aliases,
+				"status":        page.Status,
+				"source_refs":   page.SourceRefs,
+				"chunk_refs":    page.ChunkRefs,
+				"page_metadata": page.PageMetadata,
+				"parent_slug":   page.ParentSlug,
+				"folder_id":     page.FolderID,
+				"category_path": page.CategoryPath,
+				"wiki_path":     page.WikiPath,
+				"depth":         page.Depth,
+				"sort_order":    page.SortOrder,
+				"updated_at":    page.UpdatedAt,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return ErrWikiPageNotFound
+		}
+		if err := syncWikiSourceRefIndexForPage(tx, page); err != nil {
+			return err
+		}
+		return markCitationProfileMappingsDirtyForPage(tx, page, page.UpdatedAt.UTC())
+	})
 }
 
 // GetByID retrieves a wiki page by its unique ID
@@ -1192,32 +1510,52 @@ func (r *wikiPageRepository) ListRecentForSuggestions(
 	return pages, nil
 }
 
-// Delete soft-deletes a wiki page by knowledge base ID and slug
+// Delete soft-deletes a wiki page by knowledge base ID and slug.
 func (r *wikiPageRepository) Delete(ctx context.Context, kbID string, slug string) error {
-	result := r.db.WithContext(ctx).
-		Where("knowledge_base_id = ? AND slug = ?", kbID, slug).
-		Delete(&types.WikiPage{})
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		return ErrWikiPageNotFound
-	}
-	return nil
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var page types.WikiPage
+		if err := tx.Where("knowledge_base_id = ? AND slug = ?", kbID, slug).First(&page).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrWikiPageNotFound
+			}
+			return err
+		}
+		result := tx.Where("knowledge_base_id = ? AND slug = ?", kbID, slug).Delete(&types.WikiPage{})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return ErrWikiPageNotFound
+		}
+		if err := markWikiSourceRefIndexPageDeleted(tx, &page); err != nil {
+			return err
+		}
+		return markCitationProfileMappingsDirtyForPage(tx, &page, time.Now().UTC())
+	})
 }
 
-// DeleteByID soft-deletes a wiki page by ID
+// DeleteByID soft-deletes a wiki page by ID.
 func (r *wikiPageRepository) DeleteByID(ctx context.Context, id string) error {
-	result := r.db.WithContext(ctx).
-		Where("id = ?", id).
-		Delete(&types.WikiPage{})
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		return ErrWikiPageNotFound
-	}
-	return nil
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var page types.WikiPage
+		if err := tx.Where("id = ?", id).First(&page).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrWikiPageNotFound
+			}
+			return err
+		}
+		result := tx.Where("id = ?", id).Delete(&types.WikiPage{})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return ErrWikiPageNotFound
+		}
+		if err := markWikiSourceRefIndexPageDeleted(tx, &page); err != nil {
+			return err
+		}
+		return markCitationProfileMappingsDirtyForPage(tx, &page, time.Now().UTC())
+	})
 }
 
 // escapeLikePattern escapes LIKE / ILIKE metacharacters so the returned string

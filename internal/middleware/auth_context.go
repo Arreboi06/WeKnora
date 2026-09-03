@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/gin-gonic/gin"
@@ -32,6 +33,8 @@ type authSession struct {
 	// APIKeyScope marks machine principals; the APIKeyGate authorizes them
 	// per-route from this scope.
 	APIKeyScope *types.TenantAPIKeyScope
+	// AuthIssuedAt records the verified web access token iat for recent-auth guards.
+	AuthIssuedAt *time.Time
 	// Extra carries surface-specific context values (e.g. the authenticated
 	// embed channel) that must be visible on both surfaces like the rest.
 	Extra map[types.ContextKey]any
@@ -72,6 +75,9 @@ func applyAuthSession(c *gin.Context, s authSession) {
 	set(types.SystemAdminContextKey, s.SystemAdmin)
 	if s.APIKeyScope != nil {
 		ctx = types.WithTenantAPIKeyScope(ctx, *s.APIKeyScope)
+	}
+	if s.AuthIssuedAt != nil && !s.AuthIssuedAt.IsZero() {
+		set(types.AuthIssuedAtContextKey, s.AuthIssuedAt.UTC())
 	}
 	for key, v := range s.Extra {
 		set(key, v)

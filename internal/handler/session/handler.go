@@ -35,8 +35,9 @@ type Handler struct {
 	// artifactCollector drains skill-generated files from the session sandbox
 	// after an agent turn completes. May be nil when the sandbox backend does
 	// not support artifact collection; handlers must check before using.
-	artifactCollector *service.ArtifactCollector
-	memoryService     interfaces.MemoryService // Service for cross-session long-term memory
+	artifactCollector      *service.ArtifactCollector
+	memoryService          interfaces.MemoryService // Service for cross-session long-term memory
+	citationProfileService interfaces.CitationProfileService
 }
 
 // NewHandler creates a new instance of Handler with all necessary dependencies
@@ -59,24 +60,26 @@ func NewHandler(
 	temporaryDocuments interfaces.TemporaryDocumentService,
 	artifactCollector *service.ArtifactCollector,
 	memoryService interfaces.MemoryService,
+	citationProfileService interfaces.CitationProfileService,
 ) *Handler {
 	return &Handler{
-		sessionService:       sessionService,
-		messageService:       messageService,
-		suggestionService:    suggestionService,
-		streamManager:        streamManager,
-		config:               config,
-		knowledgebaseService: knowledgebaseService,
-		customAgentService:   customAgentService,
-		tenantService:        tenantService,
-		agentShareService:    agentShareService,
-		kbShareService:       kbShareService,
-		fileService:          fileService,
-		storageResolver:      storageResolver,
-		modelService:         modelService,
-		temporaryDocuments:   temporaryDocuments,
-		artifactCollector:    artifactCollector,
-		memoryService:        memoryService,
+		sessionService:         sessionService,
+		messageService:         messageService,
+		suggestionService:      suggestionService,
+		streamManager:          streamManager,
+		config:                 config,
+		knowledgebaseService:   knowledgebaseService,
+		customAgentService:     customAgentService,
+		tenantService:          tenantService,
+		agentShareService:      agentShareService,
+		kbShareService:         kbShareService,
+		fileService:            fileService,
+		storageResolver:        storageResolver,
+		modelService:           modelService,
+		temporaryDocuments:     temporaryDocuments,
+		artifactCollector:      artifactCollector,
+		memoryService:          memoryService,
+		citationProfileService: citationProfileService,
 		attachmentProcessor: NewAttachmentProcessor(
 			fileService,
 			documentReader,

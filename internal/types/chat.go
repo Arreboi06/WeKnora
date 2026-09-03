@@ -268,7 +268,11 @@ type References []*SearchResult
 
 // Value implements the driver.Valuer interface, used to convert References to database values
 func (c References) Value() (driver.Value, error) {
-	return json.Marshal(c)
+	data, err := json.Marshal(c)
+	if err != nil {
+		return nil, err
+	}
+	return string(data), nil
 }
 
 // Scan implements the sql.Scanner interface, used to convert database values to References
@@ -276,8 +280,13 @@ func (c *References) Scan(value interface{}) error {
 	if value == nil {
 		return nil
 	}
-	b, ok := value.([]byte)
-	if !ok {
+	var b []byte
+	switch v := value.(type) {
+	case []byte:
+		b = v
+	case string:
+		b = []byte(v)
+	default:
 		return nil
 	}
 	return json.Unmarshal(b, c)

@@ -37,6 +37,10 @@ conversation:
   extract_relationships_prompt_id: "default_extract_relationships"  # from prompt_templates/graph_extraction.yaml
   generate_questions_prompt_id: "default_generate_questions"        # from prompt_templates/generate_questions.yaml
 
+# Citation profile configuration
+citation_profile:
+  enabled: false
+
 # Knowledge base configuration
 knowledge_base:
   chunk_size: 512
