@@ -48,6 +48,7 @@ export interface SystemInfo {
 export interface DeploymentCapability {
   supported: boolean
   reason?: string
+  eligible_backends?: string[]
 }
 
 export interface DeploymentCapabilitiesResponse {

@@ -26,6 +26,16 @@
       <t-icon v-if="session?.is_pinned" name="pin" size="12px" class="chat-header__pin" />
       <span class="chat-header__title-text">{{ displayTitle }}</span>
     </h1>
+    <button
+      v-if="!titleEditing && workbenchEntryVisible"
+      type="button"
+      class="chat-header__workbench-btn"
+      title="Workbench"
+      aria-label="Workbench"
+      @click.stop="openWorkbench"
+    >
+      <t-icon name="terminal" size="15px" />
+    </button>
     <t-popup
       v-if="!titleEditing"
       v-model:visible="menuVisible"
@@ -110,11 +120,17 @@
         </div>
       </template>
     </t-popup>
+    <WorkbenchDrawer
+      v-model:visible="workbenchVisible"
+      :session-id="session?.id || ''"
+      :capability-supported="workbenchEntryVisible"
+      :eligible-backends="workbenchEligibleBackends"
+    />
   </header>
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, ref } from 'vue'
+import { computed, nextTick, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { MessagePlugin } from 'tdesign-vue-next'
 import { copyToClipboard } from '@/utils/clipboard'
@@ -127,6 +143,9 @@ import {
 } from './sessionMutations'
 import { normalizeSessionTitleDraft, SESSION_TITLE_MAX_LENGTH } from './sessionTitleEdit'
 import { buildSessionMarkdown, collectAllSessionMessages } from '@/utils/sessionMarkdown'
+import { useDeploymentCapabilitiesStore } from '@/stores/deploymentCapabilities'
+import WorkbenchDrawer from '@/components/workbench/WorkbenchDrawer.vue'
+import { shouldShowWorkbenchEntry } from '@/components/workbench/workbenchEntry'
 
 interface ChatHeaderSession {
   id: string
@@ -150,11 +169,29 @@ const menuMode = ref<MenuMode>('menu')
 const titleEditing = ref(false)
 const titleDraft = ref('')
 const titleInputRef = ref<HTMLInputElement | null>(null)
+const workbenchVisible = ref(false)
+const deploymentCapabilitiesStore = useDeploymentCapabilitiesStore()
 
 const displayTitle = computed(() => props.session?.title?.trim() || t('menu.newSession'))
 const menuOverlayClass = computed(() => (
   menuMode.value === 'menu' ? 'chat-header-menu-popup' : 'chat-header-menu-popup is-confirm'
 ))
+const workbenchCapability = computed(() => deploymentCapabilitiesStore.capabilities['sandbox.workbench'])
+const workbenchEligibleBackends = computed(() => workbenchCapability.value?.eligible_backends || [])
+const workbenchEntryVisible = computed(() => shouldShowWorkbenchEntry({
+  sessionId: props.session?.id,
+  capabilitySupported: deploymentCapabilitiesStore.isSupported('sandbox.workbench'),
+  eligibleBackends: workbenchEligibleBackends.value,
+}))
+
+onMounted(() => {
+  void deploymentCapabilitiesStore.ensureLoaded()
+})
+
+function openWorkbench(): void {
+  if (!workbenchEntryVisible.value) return
+  workbenchVisible.value = true
+}
 
 function onMenuVisibleChange(visible: boolean): void {
   if (!visible) menuMode.value = 'menu'
@@ -452,7 +489,8 @@ function handleMenuClick(data: { value: string }): void {
   color: var(--td-text-color-placeholder);
 }
 
-.chat-header__menu-btn {
+.chat-header__menu-btn,
+.chat-header__workbench-btn {
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;

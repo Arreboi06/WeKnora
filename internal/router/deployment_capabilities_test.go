@@ -108,3 +108,26 @@ func TestGetDeploymentCapabilitiesHandlerReturnsSnapshot(t *testing.T) {
 		t.Fatal("embed capability should be returned")
 	}
 }
+
+func TestT2M01AWorkbenchCapabilityFromRouterDefaultsFailClosed(t *testing.T) {
+	data := deploymentCapabilitiesFromRouter(RouterParams{})
+	capability, ok := data.Capabilities["sandbox.workbench"]
+	if !ok {
+		t.Fatal("missing sandbox.workbench capability")
+	}
+	if capability.Supported {
+		t.Fatal("sandbox.workbench must be unsupported without M01B route/backend wiring")
+	}
+	if capability.Reason != "feature_disabled" {
+		t.Fatalf("reason = %q, want feature_disabled", capability.Reason)
+	}
+}
+
+func TestT2L03WorkbenchRouteRegisteredRequiresHandler(t *testing.T) {
+	if workbenchRouteRegistered(RouterParams{}) {
+		t.Fatal("workbench route must be unregistered without a handler")
+	}
+	if !workbenchRouteRegistered(RouterParams{WorkbenchHandler: &handler.WorkbenchHandler{}}) {
+		t.Fatal("workbench route must be registered when handler is wired")
+	}
+}

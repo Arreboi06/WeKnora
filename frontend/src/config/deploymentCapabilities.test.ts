@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  DEPLOYMENT_CAPABILITY_KEYS,
   SETTINGS_SECTION_CAPABILITY,
   isDeploymentCapabilitySupported,
   type DeploymentCapabilityMap,
@@ -68,5 +69,31 @@ test('docker sandbox stays hidden unless the deployment explicitly enables it', 
       'settings.sandbox.docker',
     ),
     true,
+  )
+})
+
+test('T2-M01A workbench capability is advertised and fail-closed', () => {
+  assert.equal(DEPLOYMENT_CAPABILITY_KEYS.includes('sandbox.workbench' as never), true)
+  assert.equal(isDeploymentCapabilitySupported({}, 'sandbox.workbench' as never), false)
+  assert.equal(
+    isDeploymentCapabilitySupported(
+      { 'sandbox.workbench': { supported: false, reason: 'feature_disabled' } } as unknown as DeploymentCapabilityMap,
+      'sandbox.workbench' as never,
+    ),
+    false,
+  )
+  assert.equal(
+    isDeploymentCapabilitySupported(
+      { 'sandbox.workbench': { supported: true } } as unknown as DeploymentCapabilityMap,
+      'sandbox.workbench' as never,
+    ),
+    true,
+  )
+  assert.equal(
+    isDeploymentCapabilitySupported(
+      { 'sandbox.workbench': { supported: 'true' } } as unknown as DeploymentCapabilityMap,
+      'sandbox.workbench' as never,
+    ),
+    false,
   )
 })

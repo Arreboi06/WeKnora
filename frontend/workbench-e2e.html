@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>T2-L10 Real Workbench Browser Acceptance</title>
+  <style>
+    html, body, #app { min-height: 100%; margin: 0; }
+    body { background: #f3f5f7; font-family: Inter, Arial, sans-serif; }
+    .t2-e2e-header { position: fixed; z-index: 7000; top: 16px; left: 20px; display: flex; align-items: center; gap: 12px; padding: 10px 14px; border: 1px solid #d7dce2; border-radius: 6px; background: #fff; color: #20262e; box-shadow: 0 4px 18px rgba(0,0,0,.08); }
+    .t2-e2e-header span { color: #087443; font-weight: 700; }
+    .t2-e2e-header small { color: #6b737d; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <script type="module" src="/src/components/workbench/workbenchBrowserE2E.ts"></script>
+</body>
+</html>

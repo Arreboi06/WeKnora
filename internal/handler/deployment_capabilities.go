@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/Tencent/WeKnora/internal/application/service"
 	"github.com/Tencent/WeKnora/internal/sandbox"
 	"github.com/gin-gonic/gin"
 )
@@ -22,12 +23,14 @@ var DeploymentCapabilityKeys = []string{
 	"settings.storage",
 	"settings.sandbox",
 	"settings.sandbox.docker",
+	"sandbox.workbench",
 }
 
 // DeploymentCapability describes whether a deployment exposes a feature route.
 type DeploymentCapability struct {
-	Supported bool   `json:"supported"`
-	Reason    string `json:"reason,omitempty"`
+	Supported        bool     `json:"supported"`
+	Reason           string   `json:"reason,omitempty"`
+	EligibleBackends []string `json:"eligible_backends,omitempty"`
 }
 
 // DeploymentCapabilitiesData is returned by GET /system/capabilities.
@@ -49,6 +52,7 @@ type DeploymentFeatureAvailability struct {
 	Storage       bool
 	Sandbox       bool
 	SandboxDocker bool
+	Workbench     service.WorkbenchCapabilityStatus
 }
 
 func supportedDeploymentCapability(supported bool) DeploymentCapability {
@@ -56,6 +60,15 @@ func supportedDeploymentCapability(supported bool) DeploymentCapability {
 		return DeploymentCapability{Supported: true}
 	}
 	return DeploymentCapability{Supported: false, Reason: "route_not_registered"}
+}
+
+func workbenchDeploymentCapability(status service.WorkbenchCapabilityStatus) DeploymentCapability {
+	result := service.EvaluateWorkbenchCapability(status)
+	return DeploymentCapability{
+		Supported:        result.Supported,
+		Reason:           result.Reason,
+		EligibleBackends: result.EligibleBackends,
+	}
 }
 
 // BuildDeploymentCapabilities derives the deployment capability snapshot.
@@ -92,6 +105,7 @@ func BuildDeploymentCapabilities(
 			"settings.storage":        supportedDeploymentCapability(available.Storage),
 			"settings.sandbox":        supportedDeploymentCapability(available.Sandbox),
 			"settings.sandbox.docker": sandboxDocker,
+			"sandbox.workbench":       workbenchDeploymentCapability(available.Workbench),
 		},
 	}
 }
@@ -125,8 +139,9 @@ func overlayLiveDockerSandboxCapability(data DeploymentCapabilitiesData) Deploym
 		caps[key] = capability
 	}
 	sandboxCap := caps["settings.sandbox"]
+	dockerEnabled := sandbox.DockerBackendEnabled()
 	docker := DeploymentCapability{
-		Supported: sandboxCap.Supported && sandbox.DockerBackendEnabled(),
+		Supported: sandboxCap.Supported && dockerEnabled,
 	}
 	if sandboxCap.Supported && !docker.Supported {
 		docker.Reason = "docker_backend_disabled"
@@ -134,6 +149,12 @@ func overlayLiveDockerSandboxCapability(data DeploymentCapabilitiesData) Deploym
 		docker.Reason = "route_not_registered"
 	}
 	caps["settings.sandbox.docker"] = docker
+	if workbench := caps["sandbox.workbench"]; workbench.Supported && !dockerEnabled {
+		workbench.Supported = false
+		workbench.Reason = service.WorkbenchCapabilityReasonNoEligibleBackend
+		workbench.EligibleBackends = nil
+		caps["sandbox.workbench"] = workbench
+	}
 	data.Capabilities = caps
 	return data
 }

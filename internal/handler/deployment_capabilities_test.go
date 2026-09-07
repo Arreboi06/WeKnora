@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Tencent/WeKnora/internal/application/service"
 	"github.com/Tencent/WeKnora/internal/sandbox"
 )
 
@@ -44,6 +45,22 @@ func TestBuildDeploymentCapabilitiesIncludesAllKeys(t *testing.T) {
 	}
 }
 
+func TestT2M01AWorkbenchCapabilityIsAdvertisedFailClosed(t *testing.T) {
+	result := BuildDeploymentCapabilities("standard", DeploymentFeatureAvailability{})
+	capability, ok := result.Capabilities["sandbox.workbench"]
+	if !ok {
+		t.Fatal("missing sandbox.workbench capability")
+	}
+	if capability.Supported {
+		t.Fatal("sandbox.workbench must be unsupported by default")
+	}
+	if capability.Reason != "feature_disabled" {
+		t.Fatalf("reason = %q, want feature_disabled", capability.Reason)
+	}
+	if !slices.Contains(DeploymentCapabilityKeys, "sandbox.workbench") {
+		t.Fatal("DeploymentCapabilityKeys must include sandbox.workbench")
+	}
+}
 func TestOverlayLiveDockerSandboxCapabilityIgnoresStartupSnapshot(t *testing.T) {
 	sandbox.ClearDockerBackendEnabledOverride()
 	t.Cleanup(sandbox.ClearDockerBackendEnabledOverride)
@@ -52,6 +69,14 @@ func TestOverlayLiveDockerSandboxCapabilityIgnoresStartupSnapshot(t *testing.T) 
 	snapshot := BuildDeploymentCapabilities("standard", DeploymentFeatureAvailability{
 		Sandbox:       true,
 		SandboxDocker: true,
+		Workbench: service.WorkbenchCapabilityStatus{
+			Known:            true,
+			FeatureEnabled:   true,
+			DatabaseDialect:  "postgres",
+			SchemaReady:      true,
+			RouteRegistered:  true,
+			EligibleBackends: []string{"local-protected-docker"},
+		},
 	})
 	live := overlayLiveDockerSandboxCapability(snapshot)
 	docker := live.Capabilities["settings.sandbox.docker"]
@@ -61,11 +86,24 @@ func TestOverlayLiveDockerSandboxCapabilityIgnoresStartupSnapshot(t *testing.T) 
 	if docker.Reason != "docker_backend_disabled" {
 		t.Fatalf("reason = %q, want docker_backend_disabled", docker.Reason)
 	}
+	workbench := live.Capabilities["sandbox.workbench"]
+	if workbench.Supported {
+		t.Fatal("live docker off must hide workbench even if startup snapshot was fully supported")
+	}
+	if workbench.Reason != service.WorkbenchCapabilityReasonNoEligibleBackend {
+		t.Fatalf("workbench reason = %q, want no_eligible_backend", workbench.Reason)
+	}
+	if len(workbench.EligibleBackends) != 0 {
+		t.Fatalf("workbench eligible_backends = %#v, want empty", workbench.EligibleBackends)
+	}
 
 	t.Setenv(sandbox.DockerBackendEnabledEnv, "true")
 	enabled := overlayLiveDockerSandboxCapability(snapshot)
 	if !enabled.Capabilities["settings.sandbox.docker"].Supported {
 		t.Fatal("live env true must expose docker")
+	}
+	if !enabled.Capabilities["sandbox.workbench"].Supported {
+		t.Fatalf("live docker true must preserve supported workbench snapshot: %#v", enabled.Capabilities["sandbox.workbench"])
 	}
 }
 
@@ -97,4 +135,45 @@ func readFrontendDeploymentCapabilityKeys() ([]string, error) {
 		keys = append(keys, line)
 	}
 	return keys, nil
+}
+
+func TestT2M01AWorkbenchCapabilityReasonPrecedence(t *testing.T) {
+	cases := []struct {
+		name   string
+		status service.WorkbenchCapabilityStatus
+		reason string
+	}{
+		{name: "flag off", status: service.WorkbenchCapabilityStatus{Known: true}, reason: service.WorkbenchCapabilityReasonFeatureDisabled},
+		{name: "sqlite", status: service.WorkbenchCapabilityStatus{Known: true, FeatureEnabled: true, DatabaseDialect: "sqlite"}, reason: service.WorkbenchCapabilityReasonUnsupportedDatabase},
+		{name: "missing migration", status: service.WorkbenchCapabilityStatus{Known: true, FeatureEnabled: true, DatabaseDialect: "postgres"}, reason: service.WorkbenchCapabilityReasonMigrationUnavailable},
+		{name: "no route", status: service.WorkbenchCapabilityStatus{Known: true, FeatureEnabled: true, DatabaseDialect: "postgres", SchemaReady: true, EligibleBackends: []string{"local-protected-docker"}}, reason: service.WorkbenchCapabilityReasonRouteNotRegistered},
+		{name: "no backend", status: service.WorkbenchCapabilityStatus{Known: true, FeatureEnabled: true, DatabaseDialect: "postgres", SchemaReady: true, RouteRegistered: true}, reason: service.WorkbenchCapabilityReasonNoEligibleBackend},
+		{name: "unknown last", status: service.WorkbenchCapabilityStatus{FeatureEnabled: true, DatabaseDialect: "postgres", SchemaReady: true, RouteRegistered: true, EligibleBackends: []string{"local-protected-docker"}}, reason: service.WorkbenchCapabilityReasonUnknown},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			capability := BuildDeploymentCapabilities("standard", DeploymentFeatureAvailability{Workbench: tc.status}).Capabilities["sandbox.workbench"]
+			if capability.Supported {
+				t.Fatalf("sandbox.workbench unexpectedly supported for %s", tc.name)
+			}
+			if capability.Reason != tc.reason {
+				t.Fatalf("reason = %q, want %q", capability.Reason, tc.reason)
+			}
+		})
+	}
+
+	capability := BuildDeploymentCapabilities("standard", DeploymentFeatureAvailability{Workbench: service.WorkbenchCapabilityStatus{
+		Known:            true,
+		FeatureEnabled:   true,
+		DatabaseDialect:  "postgres",
+		SchemaReady:      true,
+		RouteRegistered:  true,
+		EligibleBackends: []string{"local-protected-docker"},
+	}}).Capabilities["sandbox.workbench"]
+	if !capability.Supported {
+		t.Fatalf("sandbox.workbench should be supported only when every prerequisite is true: %#v", capability)
+	}
+	if got := strings.Join(capability.EligibleBackends, ","); got != "local-protected-docker" {
+		t.Fatalf("eligible_backends = %q, want local-protected-docker", got)
+	}
 }

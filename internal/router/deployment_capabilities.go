@@ -1,11 +1,19 @@
 package router
 
 import (
+	"context"
+
+	"github.com/Tencent/WeKnora/internal/application/service"
 	"github.com/Tencent/WeKnora/internal/handler"
 	"github.com/Tencent/WeKnora/internal/sandbox"
 )
 
 func deploymentCapabilitiesFromRouter(params RouterParams) handler.DeploymentCapabilitiesData {
+	workbench := service.WorkbenchCapabilityStatus{Known: false}
+	if params.WorkbenchCapabilityService != nil {
+		workbench = params.WorkbenchCapabilityService.Status(context.Background(), workbenchRouteRegistered(params), nil)
+	}
+
 	return handler.BuildDeploymentCapabilities(handler.Edition, handler.DeploymentFeatureAvailability{
 		Organizations: params.OrganizationHandler != nil,
 		Agents:        params.CustomAgentHandler != nil,
@@ -23,5 +31,10 @@ func deploymentCapabilitiesFromRouter(params RouterParams) handler.DeploymentCap
 		Storage:       params.StorageBackendHandler != nil,
 		Sandbox:       params.SandboxConfigHandler != nil,
 		SandboxDocker: sandbox.DockerBackendEnabled(),
+		Workbench:     workbench,
 	})
+}
+
+func workbenchRouteRegistered(params RouterParams) bool {
+	return params.WorkbenchHandler != nil
 }

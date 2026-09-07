@@ -652,6 +652,51 @@ func TestFAQImportProgressRouteRequiresRetrieveOrIngestCapability(t *testing.T) 
 	}
 }
 
+func TestT2L03WorkbenchRoutesDeclareChatCapability(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	g := &rbacGuards{}
+	v1 := gin.New().Group("/api/v1")
+
+	RegisterWorkbenchRoutes(v1, &handler.WorkbenchHandler{}, g)
+
+	cases := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPost, "/api/v1/sessions/:session_id/workbench/start"},
+		{http.MethodGet, "/api/v1/sessions/:id/workbench"},
+		{http.MethodPost, "/api/v1/sessions/:session_id/workbench/jobs"},
+		{http.MethodGet, "/api/v1/sessions/:id/workbench/jobs/:job_id"},
+		{http.MethodPost, "/api/v1/sessions/:session_id/workbench/jobs/:job_id/commands"},
+		{http.MethodPost, "/api/v1/sessions/:session_id/workbench/jobs/:job_id/signals"},
+		{http.MethodGet, "/api/v1/sessions/:id/workbench/events"},
+		{http.MethodGet, "/api/v1/sessions/:id/workbench/audit"},
+		{http.MethodPost, "/api/v1/sessions/:session_id/workbench/stream-ticket"},
+		{http.MethodPost, "/api/v1/sessions/:session_id/workbench/files/browse"},
+		{http.MethodPost, "/api/v1/sessions/:session_id/workbench/files/upload"},
+		{http.MethodPost, "/api/v1/sessions/:session_id/workbench/files/download"},
+		{http.MethodPost, "/api/v1/sessions/:session_id/workbench/files/rename"},
+		{http.MethodPost, "/api/v1/sessions/:session_id/workbench/files/delete"},
+		{http.MethodGet, "/api/v1/sessions/:id/workbench/stream"},
+		{http.MethodPost, "/api/v1/sessions/:session_id/workbench/artifacts"},
+		{http.MethodGet, "/api/v1/sessions/:id/workbench/artifacts/:artifact_id/versions/:version"},
+		{http.MethodGet, "/api/v1/sessions/:id/workbench/artifacts/:artifact_id/versions/:version/download"},
+		{http.MethodGet, "/api/v1/sessions/:id/workbench/artifacts/:artifact_id/versions/:version/preview"},
+		{http.MethodPost, "/api/v1/sessions/:session_id/workbench/skill-runs/presentation"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			policy := mustLookupAPIKeyPolicy(t, g, tc.method, tc.path)
+			if !policy.RequireFullAccess {
+				t.Fatal("policy should require full access without a matching capability")
+			}
+			if !policyHasCapability(policy, types.APIKeyCapabilityChat) {
+				t.Fatalf("policy capabilities = %#v, want chat", policy.Capabilities)
+			}
+		})
+	}
+}
 func mustLookupAPIKeyPolicy(
 	t *testing.T,
 	g *rbacGuards,

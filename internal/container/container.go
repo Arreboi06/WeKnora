@@ -154,6 +154,10 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(repository.NewChunkRepository))
 	must(container.Provide(repository.NewKnowledgeTagRepository))
 	must(container.Provide(repository.NewSessionRepository))
+	must(container.Provide(repository.NewWorkbenchSessionRepository))
+	must(container.Provide(repository.NewWorkbenchControlRepository))
+	must(container.Provide(repository.NewWorkbenchArtifactRepository))
+	must(container.Provide(repository.NewWorkbenchSkillRunRepository))
 	must(container.Provide(repository.NewMessageRepository))
 	must(container.Provide(repository.NewMessageSuggestionRepository))
 	must(container.Provide(repository.NewModelRepository))
@@ -298,6 +302,13 @@ func BuildContainer(container *dig.Container) *dig.Container {
 
 	logger.Debugf(ctx, "[Container] Registering session service...")
 	must(container.Provide(service.NewSessionService))
+	must(container.Provide(service.NewWorkbenchSessionService))
+	must(container.Provide(service.NewWorkbenchControlService))
+	must(container.Provide(newWorkbenchRunnerBundle))
+	// Runtime Docker readiness is intentionally not capability certification.
+	// The production provider has no evidence-bound backend until a verified
+	// certification record is supplied by the release process.
+	must(container.Provide(newWorkbenchCapabilityService))
 	must(container.Provide(service.NewTenantSkillService))
 	// The member-facing half of env vars is its own service because its
 	// authority is different in kind: it derives the identity from the context
@@ -432,6 +443,15 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	}))
 	must(container.Provide(handler.NewOrganizationHandler))
 	must(container.Provide(handler.NewMemoryHandler))
+	must(container.Provide(func(
+		sessions interfaces.SessionService,
+		workbenches *service.WorkbenchSessionService,
+		control *service.WorkbenchControlService,
+		capability *service.WorkbenchCapabilityService,
+		runner workbenchRunnerBundle,
+	) *handler.WorkbenchHandler {
+		return handler.NewWorkbenchHandler(sessions, workbenches, control, runner.runner, runner.files, runner.artifacts, runner.presentationSkills, capability)
+	}))
 
 	// Data source handler
 	must(container.Provide(handler.NewDataSourceHandler))
