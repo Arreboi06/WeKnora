@@ -103,7 +103,7 @@ func (s *wikiPageService) CreatePage(ctx context.Context, page *types.WikiPage) 
 	}
 
 	// Update inbound links on target pages
-	s.updateInLinks(ctx, page.KnowledgeBaseID, page.Slug, page.OutLinks)
+	s.updateInLinks(ctx, page.TenantID, page.KnowledgeBaseID, page.Slug, page.OutLinks)
 
 	return page, nil
 }
@@ -119,9 +119,15 @@ func (s *wikiPageService) CreatePage(ctx context.Context, page *types.WikiPage) 
 // nothing, etc.) still persist through `UpdateMeta` but leave `version`
 // untouched so consumers can treat a bump as a real edit signal.
 func (s *wikiPageService) UpdatePage(ctx context.Context, page *types.WikiPage) (*types.WikiPage, error) {
+	if page == nil {
+		return nil, repository.ErrWikiPageNotFound
+	}
 	existing, err := s.repo.GetBySlug(ctx, page.KnowledgeBaseID, page.Slug)
 	if err != nil {
 		return nil, fmt.Errorf("get existing page: %w", err)
+	}
+	if !sameWikiPageWriteGeneration(page, existing) {
+		return nil, repository.ErrWikiPageConflict
 	}
 	stripWikiPageInlineChunkCitations(page)
 
@@ -152,8 +158,6 @@ func (s *wikiPageService) UpdatePage(ctx context.Context, page *types.WikiPage) 
 	existing.FolderID = page.FolderID
 	existing.SortOrder = page.SortOrder
 	existing.Status = page.Status
-	existing.UpdatedAt = time.Now()
-
 	// CategoryPath is a derived cache of FolderID — recompute it from the
 	// folder chain rather than trusting whatever the caller sent.
 	if err := s.applyFolderToPage(ctx, existing); err != nil {
@@ -190,8 +194,8 @@ func (s *wikiPageService) UpdatePage(ctx context.Context, page *types.WikiPage) 
 
 	// Update inbound links: remove old, add new. If content didn't change,
 	// oldOutLinks == existing.OutLinks and these calls are effectively no-ops.
-	s.removeInLinks(ctx, existing.KnowledgeBaseID, existing.Slug, oldOutLinks)
-	s.updateInLinks(ctx, existing.KnowledgeBaseID, existing.Slug, existing.OutLinks)
+	s.removeInLinks(ctx, existing.TenantID, existing.KnowledgeBaseID, existing.Slug, oldOutLinks)
+	s.updateInLinks(ctx, existing.TenantID, existing.KnowledgeBaseID, existing.Slug, existing.OutLinks)
 
 	return existing, nil
 }
@@ -199,7 +203,6 @@ func (s *wikiPageService) UpdatePage(ctx context.Context, page *types.WikiPage) 
 // UpdatePageMeta updates only metadata (status, source_refs) without version bump or link re-parse.
 func (s *wikiPageService) UpdatePageMeta(ctx context.Context, page *types.WikiPage) error {
 	normalizeWikiHierarchy(page)
-	page.UpdatedAt = time.Now()
 	return s.repo.UpdateMeta(ctx, page)
 }
 
@@ -209,25 +212,44 @@ func (s *wikiPageService) UpdatePageMeta(ctx context.Context, page *types.WikiPa
 // in-link references on target pages are refreshed so link navigation stays
 // consistent — only the user-facing revision counter is preserved.
 func (s *wikiPageService) UpdateAutoLinkedContent(ctx context.Context, page *types.WikiPage) error {
+	if page == nil {
+		return repository.ErrWikiPageNotFound
+	}
 	existing, err := s.repo.GetBySlug(ctx, page.KnowledgeBaseID, page.Slug)
 	if err != nil {
 		return fmt.Errorf("get existing page: %w", err)
+	}
+	if !sameWikiPageWriteGeneration(page, existing) {
+		return repository.ErrWikiPageConflict
 	}
 
 	oldOutLinks := existing.OutLinks
 
 	existing.Content = stripWikiInlineChunkCitations(page.Content)
 	existing.OutLinks = s.parseOutLinks(existing.Content)
-	existing.UpdatedAt = time.Now()
-
 	if err := s.repo.UpdateAutoLinkedContent(ctx, existing); err != nil {
 		return fmt.Errorf("update auto-linked content: %w", err)
 	}
 
-	s.removeInLinks(ctx, existing.KnowledgeBaseID, existing.Slug, oldOutLinks)
-	s.updateInLinks(ctx, existing.KnowledgeBaseID, existing.Slug, existing.OutLinks)
+	s.removeInLinks(ctx, existing.TenantID, existing.KnowledgeBaseID, existing.Slug, oldOutLinks)
+	s.updateInLinks(ctx, existing.TenantID, existing.KnowledgeBaseID, existing.Slug, existing.OutLinks)
 
 	return nil
+}
+
+// sameWikiPageWriteGeneration prevents the service layer from rebinding a
+// stale caller payload to a freshly loaded repository CAS token. Both the
+// user-edit and machine-decoration paths load once upstream and may spend
+// meaningful time computing a replacement; identity, revision and metadata
+// generation must all still match before any field is copied.
+func sameWikiPageWriteGeneration(candidate *types.WikiPage, current *types.WikiPage) bool {
+	return candidate != nil && current != nil &&
+		candidate.ID == current.ID &&
+		candidate.TenantID == current.TenantID &&
+		candidate.KnowledgeBaseID == current.KnowledgeBaseID &&
+		candidate.Slug == current.Slug &&
+		candidate.Version == current.Version &&
+		candidate.UpdatedAt.Equal(current.UpdatedAt)
 }
 
 // revisionFromPage builds the immutable snapshot row for the given page
@@ -402,7 +424,7 @@ func (s *wikiPageService) DeletePage(ctx context.Context, kbID string, slug stri
 	}
 
 	// Remove inbound link references from pages this page links to
-	s.removeInLinks(ctx, kbID, slug, page.OutLinks)
+	s.removeInLinks(ctx, page.TenantID, kbID, slug, page.OutLinks)
 
 	// Delete the page
 	if err := s.repo.Delete(ctx, kbID, slug); err != nil {
@@ -886,36 +908,35 @@ func (s *wikiPageService) RebuildLinks(ctx context.Context, kbID string) error {
 	if err != nil {
 		return err
 	}
-
-	// Build slug-to-page map
-	pageMap := make(map[string]*types.WikiPage)
-	for _, p := range pages {
-		pageMap[p.Slug] = p
+	if len(pages) == 0 {
+		return nil
 	}
+	sort.Slice(pages, func(i, j int) bool { return pages[i].ID < pages[j].ID })
+	tenantID := pages[0].TenantID
 
-	// Clear all inbound links first
+	// Out-links are observable Citation Profile graph state. Persist only real
+	// drift through the graph-only invalidation path, in deterministic page
+	// order, and surface every CAS/write failure to the caller.
 	for _, p := range pages {
-		p.InLinks = types.StringArray{}
-	}
-
-	// Re-parse outbound links and rebuild inbound links
-	for _, p := range pages {
-		p.OutLinks = s.parseOutLinks(p.Content)
-		for _, target := range p.OutLinks {
-			if tp, exists := pageMap[target]; exists {
-				tp.InLinks = append(tp.InLinks, p.Slug)
-			}
+		if p == nil || p.TenantID != tenantID || p.KnowledgeBaseID != kbID {
+			return fmt.Errorf("rebuild wiki links: inconsistent page identity")
+		}
+		rebuiltOutLinks := s.parseOutLinks(p.Content)
+		if slices.Equal(p.OutLinks, rebuiltOutLinks) {
+			continue
+		}
+		p.OutLinks = rebuiltOutLinks
+		if err := s.repo.UpdateAutoLinkedContent(ctx, p); err != nil {
+			return fmt.Errorf("rebuild wiki out_links for %s: %w", p.Slug, err)
 		}
 	}
 
-	// Save all pages (link rebuild is metadata-only, no version bump)
-	for _, p := range pages {
-		p.UpdatedAt = time.Now()
-		if err := s.repo.UpdateMeta(ctx, p); err != nil {
-			logger.Warnf(ctx, "wiki: failed to update links for page %s: %v", p.Slug, err)
-		}
+	// Reverse links are a denormalized projection. Recompute them in the
+	// database from the just-validated authoritative out_links snapshot; this
+	// neither touches updated_at nor schedules evidence resolution.
+	if err := s.repo.RebuildInLinks(ctx, tenantID, kbID); err != nil {
+		return fmt.Errorf("rebuild wiki in_links: %w", err)
 	}
-
 	return nil
 }
 
@@ -1200,36 +1221,21 @@ func (s *wikiPageService) RepairContentLinks(
 }
 
 // updateInLinks adds the source slug to the in_links of target pages
-func (s *wikiPageService) updateInLinks(ctx context.Context, kbID string, sourceSlug string, targets types.StringArray) {
+func (s *wikiPageService) updateInLinks(ctx context.Context, tenantID uint64, kbID string, sourceSlug string, targets types.StringArray) {
 	for _, targetSlug := range targets {
-		targetPage, err := s.repo.GetBySlug(ctx, kbID, targetSlug)
-		if err != nil {
-			continue // target page may not exist yet
-		}
-		if !containsString(targetPage.InLinks, sourceSlug) {
-			targetPage.InLinks = append(targetPage.InLinks, sourceSlug)
-			targetPage.UpdatedAt = time.Now()
-			if err := s.repo.UpdateMeta(ctx, targetPage); err != nil {
-				logger.Warnf(ctx, "wiki: failed to update in_links for %s: %v", targetSlug, err)
-			}
+		if err := s.repo.UpdateInLink(ctx, tenantID, kbID, targetSlug, sourceSlug, true); err != nil &&
+			!errors.Is(err, repository.ErrWikiPageNotFound) {
+			logger.Warnf(ctx, "wiki: failed to update in_links for %s: %v", targetSlug, err)
 		}
 	}
 }
 
 // removeInLinks removes the source slug from the in_links of target pages
-func (s *wikiPageService) removeInLinks(ctx context.Context, kbID string, sourceSlug string, targets types.StringArray) {
+func (s *wikiPageService) removeInLinks(ctx context.Context, tenantID uint64, kbID string, sourceSlug string, targets types.StringArray) {
 	for _, targetSlug := range targets {
-		targetPage, err := s.repo.GetBySlug(ctx, kbID, targetSlug)
-		if err != nil {
-			continue
-		}
-		newInLinks := removeString(targetPage.InLinks, sourceSlug)
-		if len(newInLinks) != len(targetPage.InLinks) {
-			targetPage.InLinks = newInLinks
-			targetPage.UpdatedAt = time.Now()
-			if err := s.repo.UpdateMeta(ctx, targetPage); err != nil {
-				logger.Warnf(ctx, "wiki: failed to update in_links for %s: %v", targetSlug, err)
-			}
+		if err := s.repo.UpdateInLink(ctx, tenantID, kbID, targetSlug, sourceSlug, false); err != nil &&
+			!errors.Is(err, repository.ErrWikiPageNotFound) {
+			logger.Warnf(ctx, "wiki: failed to update in_links for %s: %v", targetSlug, err)
 		}
 	}
 }
@@ -1606,7 +1612,6 @@ func (s *wikiPageService) MovePage(
 	if err := s.applyFolderToPage(ctx, page); err != nil {
 		return nil, err
 	}
-	page.UpdatedAt = time.Now()
 	normalizeWikiHierarchy(page)
 	if err := s.repo.UpdateMeta(ctx, page); err != nil {
 		return nil, fmt.Errorf("move wiki page: %w", err)
@@ -1726,7 +1731,6 @@ func (s *wikiPageService) recomputePagesForFolders(ctx context.Context, kbID str
 		if err := s.applyFolderToPage(ctx, page); err != nil {
 			return err
 		}
-		page.UpdatedAt = time.Now()
 		normalizeWikiHierarchy(page)
 		if err := s.repo.UpdateMeta(ctx, page); err != nil {
 			logger.Warnf(ctx, "wiki: recompute folder path for page %s failed: %v", page.Slug, err)

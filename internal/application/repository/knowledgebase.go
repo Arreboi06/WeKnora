@@ -8,18 +8,20 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var ErrKnowledgeBaseNotFound = errors.New("knowledge base not found")
 
 // knowledgeBaseRepository implements the KnowledgeBaseRepository interface
 type knowledgeBaseRepository struct {
-	db *gorm.DB
+	db                 *gorm.DB
+	citationProfileACL citationProfileACLInvalidationGate
 }
 
 // NewKnowledgeBaseRepository creates a new knowledge base repository
-func NewKnowledgeBaseRepository(db *gorm.DB) interfaces.KnowledgeBaseRepository {
-	return &knowledgeBaseRepository{db: db}
+func NewKnowledgeBaseRepository(db *gorm.DB, citationProfileConfig *types.CitationProfileConfig) interfaces.KnowledgeBaseRepository {
+	return &knowledgeBaseRepository{db: db, citationProfileACL: newCitationProfileACLInvalidationGate(citationProfileConfig)}
 }
 
 // CreateKnowledgeBase creates a new knowledge base
@@ -174,7 +176,22 @@ func (r *knowledgeBaseRepository) UpdateKnowledgeBase(ctx context.Context, kb *t
 
 // DeleteKnowledgeBase deletes a knowledge base
 func (r *knowledgeBaseRepository) DeleteKnowledgeBase(ctx context.Context, id string) error {
-	return r.db.WithContext(ctx).Where("id = ?", id).Delete(&types.KnowledgeBase{}).Error
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var kb types.KnowledgeBase
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", id).First(&kb).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		if err := tx.Where("id = ?", id).Delete(&types.KnowledgeBase{}).Error; err != nil {
+			return err
+		}
+		return r.citationProfileACL.invalidate(tx, types.CitationProfileACLMutation{
+			SourceTenantID:  kb.TenantID,
+			KnowledgeBaseID: kb.ID,
+		}, time.Now().UTC())
+	})
 }
 
 // CountByVectorStoreID counts active knowledge bases that are bound to the

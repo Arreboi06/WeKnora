@@ -7,6 +7,7 @@ import type { DeploymentCapabilityKey } from '@/config/deploymentCapabilities'
 import { MessagePlugin } from 'tdesign-vue-next'
 import i18n from '@/i18n'
 import { normalizeSettingsSection } from '@/config/settingsRoute'
+import { persistLoginSession } from '@/utils/authSession'
 
 /** Lite /桌面 WebView 硬刷新时可能只打开 `/`，用 session 记住上次页面以便恢复 */
 const LITE_LAST_PATH_KEY = 'weknora_lite_last_path'
@@ -219,24 +220,6 @@ const router = createRouter({
   ],
 });
 
-// 持久化 auto-setup / login 返回的认证信息到 store
-function persistLoginResponse(authStore: ReturnType<typeof useAuthStore>, response: any) {
-  if (response.user && response.tenant && response.token) {
-    authStore.setUser(userInfoFromApi(response.user, response.tenant.id))
-    authStore.setToken(response.token)
-    if (response.refresh_token) {
-      authStore.setRefreshToken(response.refresh_token)
-    }
-    authStore.setTenant({
-      id: String(response.tenant.id) || '',
-      name: response.tenant.name || '',
-      owner_id: response.user.id || '',
-      created_at: response.tenant.created_at || new Date().toISOString(),
-      updated_at: response.tenant.updated_at || new Date().toISOString()
-    })
-  }
-}
-
 async function hydrateSessionFromToken(authStore: ReturnType<typeof useAuthStore>) {
   const token = localStorage.getItem('weknora_token')
   if (!token) return false
@@ -376,8 +359,7 @@ router.beforeEach(async (to, from, next) => {
         autoSetupAttempted = true
         try {
           const response = await autoSetup()
-          if (response.success) {
-            persistLoginResponse(authStore, response)
+          if (response.success && persistLoginSession(authStore, response)) {
             authStore.setLiteMode(true)
             next(to.fullPath)
             return

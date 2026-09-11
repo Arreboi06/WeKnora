@@ -324,7 +324,7 @@ func TestCitationProfileHandlerMutationsForwardBodiesAndNoStore(t *testing.T) {
 			return &types.CitationProfileDeleteResponse{
 				OperationID: "op-delete",
 				Status:      types.CitationProfileOperationStatusAccepted,
-				ReceiptCode: types.CitationProfileReceiptHiddenPurgeScheduled,
+				ReceiptCode: types.CitationProfileReceiptHiddenAndFenced,
 			}, nil
 		},
 		requestBlindDelete: func(_ context.Context, kbID string) (*types.CitationProfileDeleteResponse, error) {

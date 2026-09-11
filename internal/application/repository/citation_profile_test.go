@@ -7,20 +7,33 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 func TestCitationProfileRepositorySetEnrollmentCreatesRandomEpochAndChecksReadVersion(t *testing.T) {
 	db := newCitationProfileRepositoryTestDB(t)
 	repo := NewCitationProfileRepository(db)
-	ctx := context.Background()
+	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(7))
+	ctx = context.WithValue(ctx, types.UserIDContextKey, "user-7")
+	ctx = types.WithAuthenticatedTenantID(ctx, 7)
+	ctx = types.WithPrincipal(ctx, types.Principal{Type: types.PrincipalWebUser, ID: "user-7"})
+	ctx = types.WithCitationProfileACLBinding(ctx, types.CitationProfileACLBinding{
+		PrincipalType:         types.PrincipalWebUser,
+		PrincipalID:           "user-7",
+		AuthenticatedTenantID: 7,
+		AccessPath:            types.CitationProfileACLAccessPathOwner,
+	})
 	zero := uint64(0)
 	idem := "11111111-1111-4111-8111-111111111111"
 
@@ -43,6 +56,85 @@ func TestCitationProfileRepositorySetEnrollmentCreatesRandomEpochAndChecksReadVe
 	require.Equal(t, scope.SubjectEpoch, replayed.SubjectEpoch)
 }
 
+func TestCitationProfileRepositoryStaleDisableWritesNothing(t *testing.T) {
+	db := newCitationProfileRepositoryTestDB(t)
+	repo := NewCitationProfileRepository(db)
+	scope := citationProfileTestScope("scope-stale-disable", "user-7", "kb-a", "epoch-stale-disable", 9, 0)
+	require.NoError(t, db.Create(scope).Error)
+
+	stale := uint64(8)
+	_, err := repo.SetEnrollment(
+		context.Background(),
+		scope.TenantID,
+		scope.SubjectID,
+		scope.KnowledgeBaseID,
+		false,
+		&stale,
+		"99999999-9999-4999-8999-999999999999",
+	)
+	require.ErrorIs(t, err, types.ErrCitationProfileChanged)
+
+	var stored types.CitationProfileScope
+	require.NoError(t, db.First(&stored, "id = ?", scope.ID).Error)
+	require.True(t, stored.Enabled)
+	require.Nil(t, stored.FencedAt)
+	require.Nil(t, stored.DeletedAt)
+	require.Equal(t, scope.ProfileReadVersion, stored.ProfileReadVersion)
+
+	var operationCount int64
+	require.NoError(t, db.Model(&types.CitationProfileOperation{}).
+		Where("scope_id = ?", scope.ID).
+		Count(&operationCount).Error)
+	require.Zero(t, operationCount)
+}
+
+func TestCitationProfileBlindDeleteRaceRollsBackOperationButKeepsGenericReceipt(t *testing.T) {
+	db := newCitationProfileRepositoryTestDB(t)
+	repo := NewCitationProfileRepository(db)
+	scope := citationProfileTestScope("scope-blind-race", "user-7", "kb-a", "epoch-blind-race", 5, 0)
+	require.NoError(t, db.Create(scope).Error)
+
+	callbackName := "topic4_force_blind_delete_fence_race"
+	require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement == nil || tx.Statement.Table != (types.CitationProfileScope{}).TableName() {
+			return
+		}
+		updates, ok := tx.Statement.Dest.(map[string]interface{})
+		if !ok {
+			return
+		}
+		if _, fencing := updates["fenced_at"]; !fencing {
+			return
+		}
+		tx.Statement.AddClause(clause.Where{Exprs: []clause.Expression{clause.Expr{SQL: "1 = 0"}}})
+	}))
+	t.Cleanup(func() { _ = db.Callback().Update().Remove(callbackName) })
+
+	receipt, err := repo.RequestBlindDelete(
+		context.Background(),
+		scope.TenantID,
+		scope.SubjectID,
+		scope.KnowledgeBaseID,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, receipt)
+	require.Equal(t, types.CitationOperationDeleteBlind, receipt.OperationType)
+	require.Equal(t, types.CitationProfileOperationStatusAccepted, receipt.Status)
+
+	var operationCount int64
+	require.NoError(t, db.Model(&types.CitationProfileOperation{}).
+		Where("scope_id = ?", scope.ID).
+		Count(&operationCount).Error)
+	require.Zero(t, operationCount, "a failed fence must roll back its operation row")
+
+	var stored types.CitationProfileScope
+	require.NoError(t, db.First(&stored, "id = ?", scope.ID).Error)
+	require.True(t, stored.Enabled)
+	require.Nil(t, stored.FencedAt)
+	require.Nil(t, stored.DeletedAt)
+	require.Equal(t, scope.ProfileReadVersion, stored.ProfileReadVersion)
+}
+
 func TestCitationProfileRepositoryResolveEvidenceEventExactZeroOneMany(t *testing.T) {
 	db := newCitationProfileRepositoryTestDB(t)
 	repo := NewCitationProfileRepository(db)
@@ -60,6 +152,9 @@ func TestCitationProfileRepositoryResolveEvidenceEventExactZeroOneMany(t *testin
 		MessageID:            "message-zero",
 		OriginReferenceIndex: 0,
 		SourceKnowledgeID:    "knowledge-zero",
+		SourceRefsSnapshot:   json.RawMessage("{}"),
+		KnowledgeSnapshot:    json.RawMessage("{}"),
+		KnowledgeBaseProof:   json.RawMessage("{}"),
 		ProducerEventKey:     "event-zero-key",
 		Status:               types.CitationProfileEventStatusPendingResolution,
 		CreatedAt:            now,
@@ -75,6 +170,9 @@ func TestCitationProfileRepositoryResolveEvidenceEventExactZeroOneMany(t *testin
 		MessageID:            "message-one",
 		OriginReferenceIndex: 1,
 		SourceKnowledgeID:    "knowledge-one",
+		SourceRefsSnapshot:   json.RawMessage("{}"),
+		KnowledgeSnapshot:    json.RawMessage("{}"),
+		KnowledgeBaseProof:   json.RawMessage("{}"),
 		ProducerEventKey:     "event-one-key",
 		Status:               types.CitationProfileEventStatusPendingResolution,
 		CreatedAt:            now,
@@ -90,6 +188,9 @@ func TestCitationProfileRepositoryResolveEvidenceEventExactZeroOneMany(t *testin
 		MessageID:            "message-many",
 		OriginReferenceIndex: 2,
 		SourceKnowledgeID:    "knowledge-many",
+		SourceRefsSnapshot:   json.RawMessage("{}"),
+		KnowledgeSnapshot:    json.RawMessage("{}"),
+		KnowledgeBaseProof:   json.RawMessage("{}"),
 		ProducerEventKey:     "event-many-key",
 		Status:               types.CitationProfileEventStatusPendingResolution,
 		CreatedAt:            now,
@@ -127,6 +228,483 @@ func TestCitationProfileRepositoryResolveEvidenceEventExactZeroOneMany(t *testin
 	require.Equal(t, runMany.ID, refreshed.ActiveRunID)
 }
 
+func TestWikiSourceUniverseChangesInvalidateResolvedEmptyEventsAndOldCursors(t *testing.T) {
+	db := newCitationProfileRepositoryTestDB(t)
+	repo := NewCitationProfileRepository(db)
+	wikiRepo := newCitationProfileWikiPageRepository(db)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	scope := citationProfileTestScope("scope-f1-universe", "user-f1", "kb-f1", "epoch-f1", 10, 0)
+	require.NoError(t, db.Create(scope).Error)
+
+	newEvent := func(id, sourceID string) *types.CitationProfileEvent {
+		event := &types.CitationProfileEvent{
+			ID:                 id,
+			TenantID:           scope.TenantID,
+			SubjectID:          scope.SubjectID,
+			KnowledgeBaseID:    scope.KnowledgeBaseID,
+			SubjectEpoch:       scope.SubjectEpoch,
+			ScopeID:            scope.ID,
+			MessageID:          "message-" + id,
+			SourceKnowledgeID:  sourceID,
+			SourceRefsSnapshot: json.RawMessage(`{}`),
+			KnowledgeSnapshot:  json.RawMessage(`{}`),
+			KnowledgeBaseProof: json.RawMessage(`{}`),
+			ProducerEventKey:   "producer-" + id,
+			Status:             types.CitationProfileEventStatusPendingResolution,
+			CreatedAt:          now,
+			UpdatedAt:          now,
+		}
+		require.NoError(t, db.Create(event).Error)
+		resolved, err := repo.ResolveEvidenceEvent(ctx, scope.TenantID, scope.SubjectID, event.ID)
+		require.NoError(t, err)
+		require.Equal(t, types.CitationProfileEventStatusResolvedEmpty, resolved.Status)
+		return event
+	}
+
+	addedEvent := newEvent("event-f1-added", "knowledge-added")
+	newPageEvent := newEvent("event-f1-new-page", "knowledge-new-page")
+
+	existingPage := &types.WikiPage{
+		ID:              "page-f1-existing",
+		TenantID:        scope.TenantID,
+		KnowledgeBaseID: scope.KnowledgeBaseID,
+		Slug:            "doc/f1-existing",
+		Title:           "F1 existing",
+		PageType:        types.WikiPageTypeConcept,
+		Status:          types.WikiPageStatusPublished,
+		Version:         1,
+		SourceRefs:      types.StringArray{"knowledge-existing|Existing"},
+		UpdatedAt:       now,
+	}
+	otherPage := &types.WikiPage{
+		ID:              "page-f1-other",
+		TenantID:        scope.TenantID,
+		KnowledgeBaseID: scope.KnowledgeBaseID,
+		Slug:            "doc/f1-other",
+		Title:           "F1 other",
+		PageType:        types.WikiPageTypeConcept,
+		Status:          types.WikiPageStatusPublished,
+		Version:         1,
+		UpdatedAt:       now,
+	}
+	require.NoError(t, wikiRepo.Create(ctx, existingPage))
+	require.NoError(t, wikiRepo.Create(ctx, otherPage))
+
+	first, err := repo.ListNodes(ctx, scope.TenantID, scope.SubjectID, scope.KnowledgeBaseID, nil, 1)
+	require.NoError(t, err)
+	require.NotNil(t, first.NextCursor, "two pages must produce an old cursor to invalidate")
+	decoded, err := base64.RawURLEncoding.DecodeString(*first.NextCursor)
+	require.NoError(t, err)
+	var oldCursor types.CitationProfileCursor
+	require.NoError(t, json.Unmarshal(decoded, &oldCursor))
+
+	newPage := &types.WikiPage{
+		ID:              "page-f1-new",
+		TenantID:        scope.TenantID,
+		KnowledgeBaseID: scope.KnowledgeBaseID,
+		Slug:            "doc/f1-new",
+		Title:           "F1 new",
+		PageType:        types.WikiPageTypeConcept,
+		Status:          types.WikiPageStatusPublished,
+		Version:         1,
+		SourceRefs:      types.StringArray{"knowledge-new-page|New page"},
+		UpdatedAt:       now.Add(time.Minute),
+	}
+	// A newly-created page must invalidate a previously resolved-empty event
+	// even though that event has no current link to discover it.
+	require.NoError(t, wikiRepo.Create(ctx, newPage))
+	var storedNewPageEvent types.CitationProfileEvent
+	require.NoError(t, db.First(&storedNewPageEvent, "id = ?", newPageEvent.ID).Error)
+	require.Equal(t, types.CitationProfileEventStatusPendingResolution, storedNewPageEvent.Status)
+	require.Empty(t, storedNewPageEvent.ActiveRunID)
+
+	// Adding a source ref to an existing page has the same obligation.
+	existingPage.SourceRefs = types.StringArray{"knowledge-existing|Existing", "knowledge-added|Added"}
+	require.NoError(t, wikiRepo.UpdateMeta(ctx, existingPage))
+	var storedAddedEvent types.CitationProfileEvent
+	require.NoError(t, db.First(&storedAddedEvent, "id = ?", addedEvent.ID).Error)
+	require.Equal(t, types.CitationProfileEventStatusPendingResolution, storedAddedEvent.Status)
+	require.Empty(t, storedAddedEvent.ActiveRunID)
+
+	var refreshedScope types.CitationProfileScope
+	require.NoError(t, db.First(&refreshedScope, "id = ?", scope.ID).Error)
+	require.Greater(t, refreshedScope.ProfileReadVersion, scope.ProfileReadVersion)
+	require.Greater(t, refreshedScope.MappingRevision, scope.MappingRevision)
+
+	// Invalidation is no-backfill: the old terminal run remains historical and
+	// no current link is published until the outbox resolves the pending event.
+	var currentLinks int64
+	require.NoError(t, db.Model(&types.EvidenceNodeLink{}).
+		Where("event_id IN ? AND relation_state = ?", []string{addedEvent.ID, newPageEvent.ID}, types.EvidenceRelationCurrent).
+		Count(&currentLinks).Error)
+	require.Zero(t, currentLinks)
+
+	_, err = repo.ListNodes(ctx, scope.TenantID, scope.SubjectID, scope.KnowledgeBaseID, &oldCursor, 1)
+	require.ErrorIs(t, err, types.ErrCitationProfileChanged)
+}
+
+func TestWikiSourceUniverseExpansionRetiresPriorRunAndRepublishesExactCurrentSet(t *testing.T) {
+	db := newCitationProfileRepositoryTestDB(t)
+	repo := NewCitationProfileRepository(db)
+	wikiRepo := newCitationProfileWikiPageRepository(db)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	scope := citationProfileTestScope("scope-f1-expanded", "user-f1-expanded", "kb-f1-expanded", "epoch-f1-expanded", 1, 1)
+	require.NoError(t, db.Create(scope).Error)
+
+	pageA := &types.WikiPage{
+		ID:              "page-f1-expanded-a",
+		TenantID:        scope.TenantID,
+		KnowledgeBaseID: scope.KnowledgeBaseID,
+		Slug:            "doc/f1-expanded-a",
+		Title:           "F1 expanded A",
+		PageType:        types.WikiPageTypeConcept,
+		Status:          types.WikiPageStatusPublished,
+		Version:         1,
+		SourceRefs:      types.StringArray{"knowledge-f1-expanded|A"},
+		UpdatedAt:       now,
+	}
+	require.NoError(t, wikiRepo.Create(ctx, pageA))
+	event := &types.CitationProfileEvent{
+		ID:                 "event-f1-expanded",
+		TenantID:           scope.TenantID,
+		SubjectID:          scope.SubjectID,
+		KnowledgeBaseID:    scope.KnowledgeBaseID,
+		SubjectEpoch:       scope.SubjectEpoch,
+		ScopeID:            scope.ID,
+		MessageID:          "message-f1-expanded",
+		SourceKnowledgeID:  "knowledge-f1-expanded",
+		SourceRefsSnapshot: json.RawMessage(`{}`),
+		KnowledgeSnapshot:  json.RawMessage(`{}`),
+		KnowledgeBaseProof: json.RawMessage(`{}`),
+		ProducerEventKey:   "producer-f1-expanded",
+		Status:             types.CitationProfileEventStatusPendingResolution,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}
+	require.NoError(t, db.Create(event).Error)
+	firstRun, err := repo.ResolveEvidenceEvent(ctx, scope.TenantID, scope.SubjectID, event.ID)
+	require.NoError(t, err)
+	require.Equal(t, types.CitationProfileEventStatusResolved, firstRun.Status)
+
+	var firstRunLinks []types.EvidenceNodeLink
+	require.NoError(t, db.Where("resolution_run_id = ?", firstRun.ID).Find(&firstRunLinks).Error)
+	require.Len(t, firstRunLinks, 1)
+	require.Equal(t, types.EvidenceRelationCurrent, firstRunLinks[0].RelationState)
+
+	pageB := &types.WikiPage{
+		ID:              "page-f1-expanded-b",
+		TenantID:        scope.TenantID,
+		KnowledgeBaseID: scope.KnowledgeBaseID,
+		Slug:            "doc/f1-expanded-b",
+		Title:           "F1 expanded B",
+		PageType:        types.WikiPageTypeConcept,
+		Status:          types.WikiPageStatusPublished,
+		Version:         1,
+		SourceRefs:      types.StringArray{"knowledge-f1-expanded|B"},
+		UpdatedAt:       now.Add(time.Minute),
+	}
+	require.NoError(t, wikiRepo.Create(ctx, pageB))
+
+	var invalidated types.CitationProfileEvent
+	require.NoError(t, db.First(&invalidated, "id = ?", event.ID).Error)
+	require.Equal(t, types.CitationProfileEventStatusPendingResolution, invalidated.Status)
+	require.Empty(t, invalidated.ActiveRunID)
+	var currentBeforeRerun int64
+	require.NoError(t, db.Model(&types.EvidenceNodeLink{}).
+		Where("event_id = ? AND relation_state = ?", event.ID, types.EvidenceRelationCurrent).
+		Count(&currentBeforeRerun).Error)
+	if currentBeforeRerun != 0 {
+		t.Errorf("source-universe invalidation left %d prior-run current links; want 0", currentBeforeRerun)
+	}
+
+	secondRun, err := repo.ResolveEvidenceEvent(ctx, scope.TenantID, scope.SubjectID, event.ID)
+	require.NoError(t, err)
+	require.NotEqual(t, firstRun.ID, secondRun.ID)
+	var currentAfterRerun []types.EvidenceNodeLink
+	require.NoError(t, db.Where("event_id = ? AND relation_state = ?", event.ID, types.EvidenceRelationCurrent).
+		Order("page_uuid ASC, id ASC").Find(&currentAfterRerun).Error)
+	require.Len(t, currentAfterRerun, 2, "rerun must publish exactly one current link per current source-ref row")
+	require.Equal(t, pageA.ID, currentAfterRerun[0].PageUUID)
+	require.Equal(t, pageB.ID, currentAfterRerun[1].PageUUID)
+	for _, link := range currentAfterRerun {
+		require.Equal(t, secondRun.ID, link.ResolutionRunID)
+	}
+	var firstRunHistorical int64
+	require.NoError(t, db.Model(&types.EvidenceNodeLink{}).
+		Where("resolution_run_id = ? AND relation_state = ?", firstRun.ID, types.EvidenceRelationHistorical).
+		Count(&firstRunHistorical).Error)
+	require.Equal(t, int64(1), firstRunHistorical)
+}
+
+func TestResolveEvidenceEventPublishesLinksAtRunMappingRevision(t *testing.T) {
+	db := newCitationProfileRepositoryTestDB(t)
+	repo := NewCitationProfileRepository(db)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	scope := citationProfileTestScope("scope-f1-revision", "user-f1-revision", "kb-f1-revision", "epoch-f1-revision", 1, 1)
+	scope.MappingRevision = 10
+	scope.SourceUniverseWatermark = "wm-before-rerun"
+	require.NoError(t, db.Create(scope).Error)
+	require.NoError(t, db.Create(&[]types.WikiSourceRefIndex{
+		citationProfileSourceRefRow("row-f1-revision-a", scope.KnowledgeBaseID, "knowledge-f1-revision", "page-f1-revision-a", 1, 1),
+		citationProfileSourceRefRow("row-f1-revision-b", scope.KnowledgeBaseID, "knowledge-f1-revision", "page-f1-revision-b", 3, 3),
+	}).Error)
+	event := &types.CitationProfileEvent{
+		ID:                 "event-f1-revision",
+		TenantID:           scope.TenantID,
+		SubjectID:          scope.SubjectID,
+		KnowledgeBaseID:    scope.KnowledgeBaseID,
+		SubjectEpoch:       scope.SubjectEpoch,
+		ScopeID:            scope.ID,
+		MessageID:          "message-f1-revision",
+		SourceKnowledgeID:  "knowledge-f1-revision",
+		SourceRefsSnapshot: json.RawMessage(`{}`),
+		KnowledgeSnapshot:  json.RawMessage(`{}`),
+		KnowledgeBaseProof: json.RawMessage(`{}`),
+		ProducerEventKey:   "producer-f1-revision",
+		Status:             types.CitationProfileEventStatusPendingResolution,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}
+	require.NoError(t, db.Create(event).Error)
+
+	run, err := repo.ResolveEvidenceEvent(ctx, scope.TenantID, scope.SubjectID, event.ID)
+	require.NoError(t, err)
+	var refreshedScope types.CitationProfileScope
+	require.NoError(t, db.First(&refreshedScope, "id = ?", scope.ID).Error)
+	require.Equal(t, run.RunMappingRevision, refreshedScope.MappingRevision)
+	var links []types.EvidenceNodeLink
+	require.NoError(t, db.Where("resolution_run_id = ?", run.ID).Order("page_uuid ASC").Find(&links).Error)
+	require.Len(t, links, 2)
+	var refs []types.WikiSourceRefIndex
+	require.NoError(t, db.Where("knowledge_base_id = ? AND source_knowledge_id = ? AND lifecycle_state = ?",
+		scope.KnowledgeBaseID, event.SourceKnowledgeID, "current").Find(&refs).Error)
+	currentKeys := make(map[citationProfileSourceRefKey]struct{}, len(refs))
+	for _, ref := range refs {
+		currentKeys[citationProfileSourceRefKeyFromIndex(ref)] = struct{}{}
+	}
+	for _, link := range links {
+		require.Equal(t, run.RunMappingRevision, link.MappingRevision)
+		require.False(t, citationProfileLinkStale(&refreshedScope, link, currentKeys))
+	}
+}
+
+func TestWikiSourceRefSameVersionRemovalInvalidatesPendingEventAndCursor(t *testing.T) {
+	db := newCitationProfileRepositoryTestDB(t)
+	repo := NewCitationProfileRepository(db)
+	wikiRepo := newCitationProfileWikiPageRepository(db)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	scope := citationProfileTestScope("scope-f1-same-version", "user-f1-same-version", "kb-f1-same-version", "epoch-f1-same-version", 1, 1)
+	require.NoError(t, db.Create(scope).Error)
+
+	page := &types.WikiPage{
+		ID:              "page-f1-same-version",
+		TenantID:        scope.TenantID,
+		KnowledgeBaseID: scope.KnowledgeBaseID,
+		Slug:            "doc/f1-same-version",
+		Title:           "F1 same version",
+		PageType:        types.WikiPageTypeConcept,
+		Status:          types.WikiPageStatusPublished,
+		Version:         1,
+		UpdatedAt:       now,
+	}
+	require.NoError(t, wikiRepo.Create(ctx, page))
+	require.NoError(t, wikiRepo.Create(ctx, &types.WikiPage{
+		ID:              "page-f1-same-version-other",
+		TenantID:        scope.TenantID,
+		KnowledgeBaseID: scope.KnowledgeBaseID,
+		Slug:            "doc/f1-same-version-other",
+		Title:           "F1 same version other",
+		PageType:        types.WikiPageTypeConcept,
+		Status:          types.WikiPageStatusPublished,
+		Version:         1,
+		UpdatedAt:       now,
+	}))
+	event := &types.CitationProfileEvent{
+		ID:                 "event-f1-same-version",
+		TenantID:           scope.TenantID,
+		SubjectID:          scope.SubjectID,
+		KnowledgeBaseID:    scope.KnowledgeBaseID,
+		SubjectEpoch:       scope.SubjectEpoch,
+		ScopeID:            scope.ID,
+		MessageID:          "message-f1-same-version",
+		SourceKnowledgeID:  "knowledge-f1-same-version",
+		SourceRefsSnapshot: json.RawMessage(`{}`),
+		KnowledgeSnapshot:  json.RawMessage(`{}`),
+		KnowledgeBaseProof: json.RawMessage(`{}`),
+		ProducerEventKey:   "producer-f1-same-version",
+		Status:             types.CitationProfileEventStatusPendingResolution,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}
+	require.NoError(t, db.Create(event).Error)
+	run, err := repo.ResolveEvidenceEvent(ctx, scope.TenantID, scope.SubjectID, event.ID)
+	require.NoError(t, err)
+	require.Equal(t, types.CitationProfileEventStatusResolvedEmpty, run.Status)
+
+	page.SourceRefs = types.StringArray{"knowledge-f1-same-version|Added"}
+	require.NoError(t, wikiRepo.UpdateMeta(ctx, page))
+	require.Equal(t, 1, page.Version, "UpdateMeta must exercise the same-version index replacement path")
+	var afterAdd types.CitationProfileScope
+	require.NoError(t, db.First(&afterAdd, "id = ?", scope.ID).Error)
+	firstPage, err := repo.ListNodes(ctx, scope.TenantID, scope.SubjectID, scope.KnowledgeBaseID, nil, 1)
+	require.NoError(t, err)
+	require.NotNil(t, firstPage.NextCursor)
+	decoded, err := base64.RawURLEncoding.DecodeString(*firstPage.NextCursor)
+	require.NoError(t, err)
+	var cursorAfterAdd types.CitationProfileCursor
+	require.NoError(t, json.Unmarshal(decoded, &cursorAfterAdd))
+
+	page.SourceRefs = nil
+	require.NoError(t, wikiRepo.UpdateMeta(ctx, page))
+	require.Equal(t, 1, page.Version)
+	var afterRemove types.CitationProfileScope
+	require.NoError(t, db.First(&afterRemove, "id = ?", scope.ID).Error)
+	require.Greater(t, afterRemove.ProfileReadVersion, afterAdd.ProfileReadVersion)
+	require.Greater(t, afterRemove.MappingRevision, afterAdd.MappingRevision)
+	_, err = repo.ListNodes(ctx, scope.TenantID, scope.SubjectID, scope.KnowledgeBaseID, &cursorAfterAdd, 1)
+	require.ErrorIs(t, err, types.ErrCitationProfileChanged)
+}
+
+func TestWikiSourceUniverseRequeueRevivesTerminalOutboxWithFreshRetryBudget(t *testing.T) {
+	for _, terminalStatus := range []string{
+		types.CitationProfileOutboxStatusDeadletter,
+		types.CitationProfileOutboxStatusDelivered,
+	} {
+		t.Run(terminalStatus, func(t *testing.T) {
+			db := newCitationProfileRepositoryTestDB(t)
+			repo := &citationProfileRepository{db: db}
+			wikiRepo := newCitationProfileWikiPageRepository(db)
+			ctx := context.Background()
+			now := time.Now().UTC()
+			old := now.Add(-48 * time.Hour)
+			scope := citationProfileTestScope("scope-f1-outbox-"+terminalStatus, "user-f1-outbox-"+terminalStatus, "kb-f1-outbox-"+terminalStatus, "epoch-f1-outbox-"+terminalStatus, 1, 0)
+			require.NoError(t, db.Create(scope).Error)
+			event := &types.CitationProfileEvent{
+				ID:                 "event-f1-outbox-" + terminalStatus,
+				TenantID:           scope.TenantID,
+				SubjectID:          scope.SubjectID,
+				KnowledgeBaseID:    scope.KnowledgeBaseID,
+				SubjectEpoch:       scope.SubjectEpoch,
+				ScopeID:            scope.ID,
+				MessageID:          "message-f1-outbox-" + terminalStatus,
+				SourceKnowledgeID:  "knowledge-f1-outbox",
+				SourceRefsSnapshot: json.RawMessage(`{}`),
+				KnowledgeSnapshot:  json.RawMessage(`{}`),
+				KnowledgeBaseProof: json.RawMessage(`{}`),
+				ProducerEventKey:   "producer-f1-outbox-" + terminalStatus,
+				Status:             types.CitationProfileEventStatusResolvedEmpty,
+				CreatedAt:          old,
+				UpdatedAt:          old,
+			}
+			require.NoError(t, db.Create(event).Error)
+			terminalAt := old.Add(time.Hour)
+			outbox := &types.CitationProfileEventOutbox{
+				ID:               "outbox-f1-" + terminalStatus,
+				TenantID:         scope.TenantID,
+				SubjectID:        scope.SubjectID,
+				KnowledgeBaseID:  scope.KnowledgeBaseID,
+				SubjectEpoch:     scope.SubjectEpoch,
+				ScopeID:          scope.ID,
+				EventID:          event.ID,
+				Status:           terminalStatus,
+				AttemptCount:     8,
+				NextAttemptAt:    old,
+				LastErrorCode:    "old-error",
+				LastErrorMessage: "old failure",
+				CreatedAt:        old,
+				UpdatedAt:        terminalAt,
+			}
+			if terminalStatus == types.CitationProfileOutboxStatusDeadletter {
+				outbox.DeadletterAt = &terminalAt
+			} else {
+				outbox.DeliveredAt = &terminalAt
+			}
+			require.NoError(t, db.Create(outbox).Error)
+
+			requeueAt := now.Add(time.Minute)
+			requeueStartedAt, err := citationProfileDatabaseNow(db)
+			require.NoError(t, err)
+			require.NoError(t, wikiRepo.Create(ctx, &types.WikiPage{
+				ID:              "page-f1-outbox-" + terminalStatus,
+				TenantID:        scope.TenantID,
+				KnowledgeBaseID: scope.KnowledgeBaseID,
+				Slug:            "doc/f1-outbox-" + terminalStatus,
+				Title:           "F1 outbox " + terminalStatus,
+				PageType:        types.WikiPageTypeConcept,
+				Status:          types.WikiPageStatusPublished,
+				Version:         1,
+				SourceRefs:      types.StringArray{"knowledge-f1-outbox|Requeue"},
+				UpdatedAt:       requeueAt,
+			}))
+			requeueFinishedAt, err := citationProfileDatabaseNow(db)
+			require.NoError(t, err)
+
+			var stored types.CitationProfileEventOutbox
+			require.NoError(t, db.First(&stored, "id = ?", outbox.ID).Error)
+			require.Equal(t, types.CitationProfileOutboxStatusPending, stored.Status)
+			require.Zero(t, stored.AttemptCount)
+			require.Nil(t, stored.LockedAt)
+			require.Empty(t, stored.LockedBy)
+			require.Nil(t, stored.DeliveredAt)
+			require.Nil(t, stored.DeadletterAt)
+			require.Empty(t, stored.LastErrorCode)
+			require.Empty(t, stored.LastErrorMessage)
+			require.True(t, stored.CreatedAt.After(terminalAt), "requeue must replace the terminal row's exhausted max-age budget")
+			require.False(t, stored.CreatedAt.Before(requeueStartedAt.Add(-time.Second)), "requeue time must come from the database clock")
+			require.False(t, stored.CreatedAt.After(requeueFinishedAt.Add(time.Second)), "requeue time must come from the database clock")
+
+			claims, err := repo.ClaimCitationProfileEventOutbox(ctx, "f1-requeue-worker", 1, requeueAt, time.Minute)
+			require.NoError(t, err)
+			require.Len(t, claims, 1)
+			require.Equal(t, outbox.ID, claims[0].ID)
+		})
+	}
+}
+
+type citationProfileSQLCapture struct {
+	lines []string
+}
+
+func (c *citationProfileSQLCapture) Printf(format string, args ...interface{}) {
+	c.lines = append(c.lines, fmt.Sprintf(format, args...))
+}
+
+func TestCitationProfileMultiScopeInvalidationLocksScopesInDatabaseOrder(t *testing.T) {
+	db := newCitationProfileRepositoryTestDB(t)
+	now := time.Now().UTC()
+	scopeA := citationProfileTestScope("scope-f6-a", "user-f6-a", "kb-f6", "epoch-f6-a", 1, 0)
+	scopeZ := citationProfileTestScope("scope-f6-z", "user-f6-z", "kb-f6", "epoch-f6-z", 1, 0)
+	require.NoError(t, db.Create(&[]types.CitationProfileScope{*scopeZ, *scopeA}).Error)
+	for _, event := range []types.CitationProfileEvent{
+		{ID: "event-f6-z", TenantID: 7, SubjectID: scopeZ.SubjectID, KnowledgeBaseID: scopeZ.KnowledgeBaseID, SubjectEpoch: scopeZ.SubjectEpoch, ScopeID: scopeZ.ID, MessageID: "message-f6-z", SourceKnowledgeID: "source-f6-z", ProducerEventKey: "producer-f6-z", SourceRefsSnapshot: json.RawMessage("{}"), KnowledgeSnapshot: json.RawMessage("{}"), KnowledgeBaseProof: json.RawMessage("{}"), Status: types.CitationProfileEventStatusResolvedEmpty, CreatedAt: now, UpdatedAt: now},
+		{ID: "event-f6-a", TenantID: 7, SubjectID: scopeA.SubjectID, KnowledgeBaseID: scopeA.KnowledgeBaseID, SubjectEpoch: scopeA.SubjectEpoch, ScopeID: scopeA.ID, MessageID: "message-f6-a", SourceKnowledgeID: "source-f6-a", ProducerEventKey: "producer-f6-a", SourceRefsSnapshot: json.RawMessage("{}"), KnowledgeSnapshot: json.RawMessage("{}"), KnowledgeBaseProof: json.RawMessage("{}"), Status: types.CitationProfileEventStatusResolvedEmpty, CreatedAt: now, UpdatedAt: now},
+	} {
+		require.NoError(t, db.Create(&event).Error)
+	}
+	capture := &citationProfileSQLCapture{}
+	observedDB := db.Session(&gorm.Session{Logger: gormlogger.New(capture, gormlogger.Config{LogLevel: gormlogger.Info})})
+	require.NoError(t, markCitationProfileMappingsDirtyForPage(observedDB, &types.WikiPage{
+		ID:              "page-f6",
+		TenantID:        7,
+		KnowledgeBaseID: "kb-f6",
+		SourceRefs:      types.StringArray{"source-f6-z", "source-f6-a"},
+		UpdatedAt:       now,
+	}, now))
+	var scopeLockSQL []string
+	for _, line := range capture.lines {
+		lower := strings.ToLower(line)
+		if strings.Contains(lower, "citation_profile_scopes") && strings.Contains(lower, "select") {
+			scopeLockSQL = append(scopeLockSQL, line)
+		}
+	}
+	require.NotEmpty(t, scopeLockSQL)
+	require.Contains(t, strings.ToLower(strings.Join(scopeLockSQL, "\n")), "order by id asc")
+}
+
 func TestCitationProfileRepositoryExportAndDeleteStaySubjectScoped(t *testing.T) {
 	db := newCitationProfileRepositoryTestDB(t)
 	repo := NewCitationProfileRepository(db)
@@ -146,6 +724,9 @@ func TestCitationProfileRepositoryExportAndDeleteStaySubjectScoped(t *testing.T)
 		MessageID:            "message-u1",
 		OriginReferenceIndex: 0,
 		SourceKnowledgeID:    "knowledge-u1",
+		SourceRefsSnapshot:   json.RawMessage("{}"),
+		KnowledgeSnapshot:    json.RawMessage("{}"),
+		KnowledgeBaseProof:   json.RawMessage("{}"),
 		ProducerEventKey:     "event-u1-key",
 		Status:               types.CitationProfileEventStatusResolved,
 		ActiveRunID:          "run-u1",
@@ -235,6 +816,7 @@ func TestCitationProfileRepositoryReadsNodesGraphAndEvidence(t *testing.T) {
 		OriginReferenceIndex: 0,
 		SourceKnowledgeID:    "knowledge-a",
 		SourceResultID:       "result-a",
+		SourceRefsSnapshot:   json.RawMessage(`{}`),
 		ProducerEventKey:     "event-read-key",
 		Status:               types.CitationProfileEventStatusResolved,
 		ActiveRunID:          "run-read",
@@ -265,6 +847,7 @@ func TestCitationProfileRepositoryReadsNodesGraphAndEvidence(t *testing.T) {
 		{ID: "link-read", TenantID: 7, SubjectID: "user-7", KnowledgeBaseID: "kb-a", SubjectEpoch: "epoch-read", ScopeID: "scope-read", EventID: "event-read", ResolutionRunID: "run-read", SourceKnowledgeID: "knowledge-a", PageUUID: "page-b", PageVersion: 2, NormalizedRef: "knowledge-a", RelationState: types.EvidenceRelationCurrent, RelationSource: "source_ref_index", MappingRevision: 20, UniverseWatermark: "wm-current", CreatedAt: resolvedAt},
 		{ID: "link-other", TenantID: 7, SubjectID: "user-8", KnowledgeBaseID: "kb-a", SubjectEpoch: "epoch-other", ScopeID: "scope-other", EventID: "event-other", ResolutionRunID: "run-other", SourceKnowledgeID: "knowledge-b", PageUUID: "page-b", PageVersion: 2, NormalizedRef: "knowledge-b", RelationState: types.EvidenceRelationCurrent, RelationSource: "source_ref_index", MappingRevision: 20, UniverseWatermark: "wm-current", CreatedAt: resolvedAt},
 	}).Error)
+	require.NoError(t, db.Create(citationProfileSourceRefRow("source-ref-read", "kb-a", "knowledge-a", "page-b", 2, 20)).Error)
 
 	first, err := repo.ListNodes(ctx, 7, "user-7", "kb-a", nil, 1)
 	require.NoError(t, err)
@@ -278,6 +861,12 @@ func TestCitationProfileRepositoryReadsNodesGraphAndEvidence(t *testing.T) {
 	rawCursor, err := base64.RawURLEncoding.DecodeString(*first.NextCursor)
 	require.NoError(t, err)
 	require.NoError(t, json.Unmarshal(rawCursor, &cursor))
+	require.NotEmpty(t, first.Snapshot.EventCutoff)
+	require.NotEmpty(t, first.Snapshot.CorrectionCutoff)
+	require.NotEmpty(t, first.Snapshot.ActiveRunPointerCutoff)
+	require.Equal(t, first.Snapshot.EventCutoff, cursor.EventCutoff)
+	require.Equal(t, first.Snapshot.CorrectionCutoff, cursor.CorrectionCutoff)
+	require.Equal(t, first.Snapshot.ActiveRunPointerCutoff, cursor.ActiveRunPointerCutoff)
 	second, err := repo.ListNodes(ctx, 7, "user-7", "kb-a", &cursor, 1)
 	require.NoError(t, err)
 	require.Len(t, second.Items, 1)
@@ -366,22 +955,35 @@ func newCitationProfileRepositoryTestDB(t *testing.T) *gorm.DB {
 	return db
 }
 
+func newCitationProfileWikiPageRepository(db *gorm.DB) interfaces.WikiPageRepository {
+	return NewWikiPageRepository(db, &types.CitationProfileConfig{Enabled: true})
+}
+
 func citationProfileTestScope(id string, subjectID string, kbID string, epoch string, readVersion uint64, pendingEvents int) *types.CitationProfileScope {
 	now := time.Now().UTC()
+	checkedAt := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	nextCheckAt := time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)
 	return &types.CitationProfileScope{
-		ID:                     id,
-		TenantID:               7,
-		SubjectID:              subjectID,
-		KnowledgeBaseID:        kbID,
-		SubjectEpoch:           epoch,
-		ProfileReadVersion:     readVersion,
-		ProfilePolicyVersion:   types.CitationProfilePolicyVersion,
-		RetentionPolicyVersion: types.CitationProfileRetentionPolicyVersion,
-		Enabled:                true,
-		ACLCheckState:          "current",
-		PendingEventCount:      pendingEvents,
-		CreatedAt:              now,
-		UpdatedAt:              now,
+		ID:                       id,
+		TenantID:                 7,
+		SubjectID:                subjectID,
+		KnowledgeBaseID:          kbID,
+		SubjectEpoch:             epoch,
+		ProfileReadVersion:       readVersion,
+		ProfilePolicyVersion:     types.CitationProfilePolicyVersion,
+		RetentionPolicyVersion:   types.CitationProfileRetentionPolicyVersion,
+		Enabled:                  true,
+		ACLCheckState:            types.CitationProfileACLStateCurrent,
+		ACLCheckedAt:             &checkedAt,
+		NextACLCheckAt:           &nextCheckAt,
+		ACLPrincipalType:         types.PrincipalWebUser,
+		ACLPrincipalID:           subjectID,
+		ACLAuthenticatedTenantID: 7,
+		ACLAccessPath:            types.CitationProfileACLAccessPathOwner,
+		ACLGeneration:            1,
+		PendingEventCount:        pendingEvents,
+		CreatedAt:                now,
+		UpdatedAt:                now,
 	}
 }
 

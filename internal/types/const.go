@@ -6,6 +6,13 @@ type ContextKey string
 const (
 	// TenantIDContextKey is the context key for tenant ID
 	TenantIDContextKey ContextKey = "TenantID"
+	// AuthenticatedTenantIDContextKey preserves the tenant that authenticated
+	// the caller when a KB access guard rewrites TenantIDContextKey to the
+	// source tenant of a shared knowledge base.
+	AuthenticatedTenantIDContextKey ContextKey = "AuthenticatedTenantID"
+	// CitationProfileACLBindingContextKey carries the server-derived proof used
+	// when enrolling or refreshing a citation-profile scope.
+	CitationProfileACLBindingContextKey ContextKey = "CitationProfileACLBinding"
 	// TenantInfoContextKey is the context key for tenant information
 	TenantInfoContextKey ContextKey = "TenantInfo"
 	// RequestIDContextKey is the context key for request ID
@@ -20,8 +27,9 @@ const (
 	PrincipalContextKey ContextKey = "Principal"
 	// TenantAPIKeyScopeContextKey carries per-API-key operation and KB scopes.
 	TenantAPIKeyScopeContextKey ContextKey = "TenantAPIKeyScope"
-	// AuthIssuedAtContextKey carries the verified web access token iat for recent-auth guards.
-	AuthIssuedAtContextKey ContextKey = "AuthIssuedAt"
+	// AuthTimeContextKey carries the last real password/IdP authentication time.
+	// Token refresh and tenant switching must preserve, never renew, this value.
+	AuthTimeContextKey ContextKey = "AuthTime"
 	// TenantRoleContextKey is the context key for the caller's TenantRole
 	// in the currently active tenant (loaded by the auth middleware from
 	// the tenant_members table). See TenantRoleFromContext.

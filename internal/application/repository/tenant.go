@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -18,12 +19,13 @@ var (
 
 // tenantRepository implements tenant repository interface
 type tenantRepository struct {
-	db *gorm.DB
+	db                 *gorm.DB
+	citationProfileACL citationProfileACLInvalidationGate
 }
 
 // NewTenantRepository creates a new tenant repository
-func NewTenantRepository(db *gorm.DB) interfaces.TenantRepository {
-	return &tenantRepository{db: db}
+func NewTenantRepository(db *gorm.DB, citationProfileConfig *types.CitationProfileConfig) interfaces.TenantRepository {
+	return &tenantRepository{db: db, citationProfileACL: newCitationProfileACLInvalidationGate(citationProfileConfig)}
 }
 
 // CreateTenant creates tenant
@@ -127,7 +129,10 @@ func (r *tenantRepository) DeleteTenant(ctx context.Context, id uint64) error {
 		if err := tx.Where("tenant_id = ?", id).Delete(&types.TenantMember{}).Error; err != nil {
 			return err
 		}
-		return tx.Where("id = ?", id).Delete(&types.Tenant{}).Error
+		if err := tx.Where("id = ?", id).Delete(&types.Tenant{}).Error; err != nil {
+			return err
+		}
+		return r.citationProfileACL.invalidateTenantDeletion(tx, id, time.Now().UTC())
 	})
 }
 

@@ -23,13 +23,22 @@
     </div>
 
     <template v-else-if="status">
-      <div v-if="emptyKind === 'feature_disabled'" class="citation-profile-empty">
+      <div v-if="panelState === 'deleted'" class="citation-profile-empty">
+        <t-icon name="check-circle" />
+        <strong>画像已停用</strong>
+        <span>历史证据已从界面隐藏；审计记录按系统保留策略处理。</span>
+        <t-button size="small" theme="primary" :loading="enrolling" @click="setEnrollment(true)">
+          重新开启我的证据画像
+        </t-button>
+      </div>
+
+      <div v-else-if="panelState === 'feature_disabled'" class="citation-profile-empty">
         <t-icon name="error-circle" />
         <strong>当前知识库未开启证据画像。</strong>
         <span>普通 Wiki 功能不受影响。</span>
       </div>
 
-      <div v-else-if="emptyKind === 'acl_unknown'" class="citation-profile-empty">
+      <div v-else-if="panelState === 'acl_unknown'" class="citation-profile-empty">
         <t-icon name="error-circle" />
         <strong>访问检查暂不可用。</strong>
         <span>采集已暂停，仍可提交账号清除请求。</span>
@@ -38,7 +47,7 @@
         </t-button>
       </div>
 
-      <div v-else-if="!status.enrolled" class="citation-profile-empty">
+      <div v-else-if="panelState === 'not_enrolled'" class="citation-profile-empty">
         <t-icon name="file-add" />
         <strong>未开启</strong>
         <span>开启后，新回答引用过的来源才会出现在这里。</span>
@@ -190,7 +199,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { MessagePlugin } from 'tdesign-vue-next'
 import {
   citationProfileClient,
@@ -203,11 +212,14 @@ import {
 } from '@/api/wiki/citationProfile'
 import {
   correctionNeedsRefresh,
+  CitationProfileRequestFence,
+  citationProfilePanelState,
   graphCapNotice,
   makeCitationProfileIdempotencyKey,
 } from './model'
 
 const props = defineProps<{ knowledgeBaseId: string }>()
+const requestFence = new CitationProfileRequestFence()
 
 const loading = ref(false)
 const nodesLoading = ref(false)
@@ -229,6 +241,7 @@ const reasonCode = ref('wrong_page')
 const operationReceipt = ref('')
 
 const emptyKind = computed(() => status.value?.empty_state?.kind)
+const panelState = computed(() => status.value ? citationProfilePanelState(status.value) : null)
 const drawerTitle = computed(() => evidence.value?.page.title || selectedNode.value?.title || '证据详情')
 const graphNotice = computed(() => graph.value ? graphCapNotice(graph.value) : null)
 const currentReadVersion = computed(() => status.value?.snapshot?.read_version || evidence.value?.snapshot?.read_version || null)
@@ -239,56 +252,93 @@ function readPayload<T>(response: T | { data: T }): T {
   return ((response as { data?: T })?.data || response) as T
 }
 
-async function loadAll() {
-  if (!props.knowledgeBaseId) return
-  loading.value = true
+function resetPanelState() {
+  loading.value = false
+  nodesLoading.value = false
+  evidenceLoading.value = false
+  enrolling.value = false
+  exporting.value = false
+  deleting.value = false
+  blindDeleting.value = false
   errorMessage.value = ''
+  status.value = null
+  nodes.value = []
+  nextCursor.value = null
+  graph.value = null
+  evidence.value = null
+  drawerVisible.value = false
+  selectedNode.value = null
+  reasonCode.value = 'wrong_page'
+  operationReceipt.value = ''
+}
+
+async function loadAll() {
+  const knowledgeBaseId = props.knowledgeBaseId
+  requestFence.reset(knowledgeBaseId)
+  resetPanelState()
+  if (!knowledgeBaseId) return null
+  const token = requestFence.begin('status')
+  loading.value = true
   try {
-    status.value = readPayload(await citationProfileClient.getStatus(props.knowledgeBaseId))
-    nodes.value = []
-    nextCursor.value = null
-    graph.value = null
-    if (status.value.enrolled && !status.value.suspended) {
+    const nextStatus = readPayload(await citationProfileClient.getStatus(knowledgeBaseId))
+    if (!requestFence.isCurrent(token, props.knowledgeBaseId)) return token
+    status.value = nextStatus
+    if (nextStatus.enrolled && !nextStatus.suspended) {
       await Promise.all([loadNodes(null), loadGraph()])
     }
   } catch (error: any) {
-    errorMessage.value = error?.message || '证据画像暂不可用。'
+    if (requestFence.isCurrent(token, props.knowledgeBaseId)) {
+      errorMessage.value = error?.message || '证据画像暂不可用。'
+    }
   } finally {
-    loading.value = false
+    if (requestFence.isCurrent(token, props.knowledgeBaseId)) loading.value = false
   }
+  return token
 }
 
 async function loadGraph() {
-  graph.value = readPayload(await citationProfileClient.getGraph(props.knowledgeBaseId))
+  const knowledgeBaseId = props.knowledgeBaseId
+  const token = requestFence.begin('graph')
+  const nextGraph = readPayload(await citationProfileClient.getGraph(knowledgeBaseId))
+  if (requestFence.isCurrent(token, props.knowledgeBaseId)) graph.value = nextGraph
 }
 
 async function loadNodes(cursor: string | null) {
+  const knowledgeBaseId = props.knowledgeBaseId
+  const token = requestFence.begin('nodes')
   nodesLoading.value = true
   try {
-    const page = readPayload(await citationProfileClient.listNodes(props.knowledgeBaseId, {
+    const page = readPayload(await citationProfileClient.listNodes(knowledgeBaseId, {
       cursor,
       page_size: status.value?.limits.list_page_size || 100,
     }))
+    if (!requestFence.isCurrent(token, props.knowledgeBaseId)) return
     nodes.value = cursor ? [...nodes.value, ...page.items] : page.items
     nextCursor.value = page.next_cursor
   } finally {
-    nodesLoading.value = false
+    if (requestFence.isCurrent(token, props.knowledgeBaseId)) nodesLoading.value = false
   }
 }
 
 async function setEnrollment(enabled: boolean) {
+  const knowledgeBaseId = props.knowledgeBaseId
+  const expectedReadVersion = status.value?.snapshot?.read_version || '0'
+  const token = requestFence.begin('enrollment')
   enrolling.value = true
   try {
-    await citationProfileClient.updateEnrollment(props.knowledgeBaseId, {
+    await citationProfileClient.updateEnrollment(knowledgeBaseId, {
       enabled,
-      expected_read_version: status.value?.snapshot?.read_version || '0',
+      expected_read_version: expectedReadVersion,
       idempotency_key: makeCitationProfileIdempotencyKey(),
     })
+    if (!requestFence.isCurrent(token, props.knowledgeBaseId)) return
     await loadAll()
   } catch (error: any) {
-    MessagePlugin.error(error?.message || '开启状态更新失败。')
+    if (requestFence.isCurrent(token, props.knowledgeBaseId)) {
+      MessagePlugin.error(error?.message || '开启状态更新失败。')
+    }
   } finally {
-    enrolling.value = false
+    if (requestFence.isCurrent(token, props.knowledgeBaseId)) enrolling.value = false
   }
 }
 
@@ -300,27 +350,36 @@ async function openEvidence(node: CitationProfileNode) {
 }
 
 async function loadEvidencePage(pageUuid: string, cursor: string | null) {
+  const knowledgeBaseId = props.knowledgeBaseId
+  const token = requestFence.begin('evidence')
   evidenceLoading.value = true
   try {
-    const page = readPayload(await citationProfileClient.getEvidence(props.knowledgeBaseId, pageUuid, {
+    const page = readPayload(await citationProfileClient.getEvidence(knowledgeBaseId, pageUuid, {
       cursor,
       page_size: status.value?.limits.list_page_size || 100,
     }))
+    if (!requestFence.isCurrent(token, props.knowledgeBaseId)) return
     evidence.value = evidence.value && cursor
       ? { ...page, items: [...evidence.value.items, ...page.items] }
       : page
   } catch (error: any) {
-    MessagePlugin.error(error?.message || '证据加载失败。')
+    if (requestFence.isCurrent(token, props.knowledgeBaseId)) {
+      MessagePlugin.error(error?.message || '证据加载失败。')
+    }
   } finally {
-    evidenceLoading.value = false
+    if (requestFence.isCurrent(token, props.knowledgeBaseId)) evidenceLoading.value = false
   }
 }
 
 async function correct(item: CitationProfileEvidenceItem, action: CitationProfileCorrectionAction) {
   if (!evidence.value || !evidence.value.snapshot || isActionBlocked.value) return
+  const knowledgeBaseId = props.knowledgeBaseId
+  const token = requestFence.begin('correction')
   const pageUuid = item.page_uuid
+  const selectedNodeBeforeReload = selectedNode.value
+  const reopenDrawer = drawerVisible.value
   try {
-    const result = readPayload(await citationProfileClient.createCorrection(props.knowledgeBaseId, {
+    const result = readPayload(await citationProfileClient.createCorrection(knowledgeBaseId, {
       expected_read_version: evidence.value.snapshot.read_version,
       idempotency_key: makeCitationProfileIdempotencyKey(),
       action,
@@ -328,13 +387,17 @@ async function correct(item: CitationProfileEvidenceItem, action: CitationProfil
       page_uuid: pageUuid,
       reason_code: reasonCode.value,
     }))
+    if (!requestFence.isCurrent(token, props.knowledgeBaseId)) return
     if (status.value?.snapshot) status.value.snapshot.read_version = result.snapshot.read_version
-    await loadAll()
-    if (drawerVisible.value) {
+    MessagePlugin.success('纠正已记录。')
+    const reloadToken = await loadAll()
+    if (reloadToken && requestFence.isCurrent(reloadToken, props.knowledgeBaseId) && reopenDrawer) {
+      selectedNode.value = nodes.value.find((node) => node.page_uuid === pageUuid) || selectedNodeBeforeReload
+      drawerVisible.value = true
       await loadEvidencePage(pageUuid, null)
     }
-    MessagePlugin.success('纠正已记录。')
   } catch (error: any) {
+    if (!requestFence.isCurrent(token, props.knowledgeBaseId)) return
     if (error?.code === 'profile_changed' || error?.status === 409) {
       MessagePlugin.warning('证据已变化，请刷新后再确认。')
       return
@@ -344,59 +407,79 @@ async function correct(item: CitationProfileEvidenceItem, action: CitationProfil
 }
 
 async function startExport() {
+  const knowledgeBaseId = props.knowledgeBaseId
+  const expectedReadVersion = currentReadVersion.value || '0'
+  const token = requestFence.begin('export')
   exporting.value = true
   try {
-    const result = readPayload(await citationProfileClient.createExport(props.knowledgeBaseId, {
-      expected_read_version: currentReadVersion.value || '0',
+    const result = readPayload(await citationProfileClient.createExport(knowledgeBaseId, {
+      expected_read_version: expectedReadVersion,
       idempotency_key: makeCitationProfileIdempotencyKey(),
       format: 'json',
     }))
+    if (!requestFence.isCurrent(token, props.knowledgeBaseId)) return
     operationReceipt.value = result.status === 'ready'
       ? '导出已准备好，请重新授权下载。'
       : '导出正在准备，将在一小时后过期。'
     if (result.status === 'ready') {
-      const blob = await citationProfileClient.downloadExport(props.knowledgeBaseId, result.operation_id)
+      const blob = await citationProfileClient.downloadExport(knowledgeBaseId, result.operation_id)
+      if (!requestFence.isCurrent(token, props.knowledgeBaseId)) return
       saveExportBlob(blob, result.operation_id)
       operationReceipt.value = '导出已下载。'
     }
   } catch (error: any) {
-    MessagePlugin.error(error?.message || '导出失败。')
+    if (requestFence.isCurrent(token, props.knowledgeBaseId)) {
+      MessagePlugin.error(error?.message || '导出失败。')
+    }
   } finally {
-    exporting.value = false
+    if (requestFence.isCurrent(token, props.knowledgeBaseId)) exporting.value = false
   }
 }
 
 async function deleteCurrent() {
+  const knowledgeBaseId = props.knowledgeBaseId
+  const expectedReadVersion = currentReadVersion.value || '0'
+  const token = requestFence.begin('delete')
   deleting.value = true
   try {
-    await citationProfileClient.deleteCurrentProfile(props.knowledgeBaseId, {
-      expected_read_version: currentReadVersion.value || '0',
+    await citationProfileClient.deleteCurrentProfile(knowledgeBaseId, {
+      expected_read_version: expectedReadVersion,
       idempotency_key: makeCitationProfileIdempotencyKey(),
     })
-    drawerVisible.value = false
-    nodes.value = []
-    graph.value = null
-    operationReceipt.value = '画像已隐藏，后续清理已安排。'
-    await loadAll()
+    if (!requestFence.isCurrent(token, props.knowledgeBaseId)) return
+    const reloadToken = await loadAll()
+    if (reloadToken && requestFence.isCurrent(reloadToken, props.knowledgeBaseId)) {
+      operationReceipt.value = '画像已停用并从界面隐藏；审计记录按系统保留策略处理。'
+    }
   } catch (error: any) {
-    MessagePlugin.error(error?.message || '删除请求失败。')
+    if (requestFence.isCurrent(token, props.knowledgeBaseId)) {
+      MessagePlugin.error(error?.message || '删除请求失败。')
+    }
   } finally {
-    deleting.value = false
+    if (requestFence.isCurrent(token, props.knowledgeBaseId)) deleting.value = false
   }
 }
 
 async function blindDelete() {
+  const knowledgeBaseId = props.knowledgeBaseId
+  const token = requestFence.begin('blind-delete')
   blindDeleting.value = true
   try {
-    await citationProfileClient.blindDeleteScope(props.knowledgeBaseId)
-    drawerVisible.value = false
-    nodes.value = []
-    graph.value = null
+    await citationProfileClient.blindDeleteScope(knowledgeBaseId)
+    if (!requestFence.isCurrent(token, props.knowledgeBaseId)) return
+    // Blind deletion deliberately does not re-read status: doing so would turn
+    // this existence-hiding endpoint into an oracle. Fence every in-flight read
+    // and remove every retained snapshot/evidence reference from component
+    // memory before acknowledging the request.
+    requestFence.reset(knowledgeBaseId)
+    resetPanelState()
     operationReceipt.value = '请求已受理。'
   } catch (error: any) {
-    MessagePlugin.error(error?.message || '请求失败。')
+    if (requestFence.isCurrent(token, props.knowledgeBaseId)) {
+      MessagePlugin.error(error?.message || '请求失败。')
+    }
   } finally {
-    blindDeleting.value = false
+    if (requestFence.isCurrent(token, props.knowledgeBaseId)) blindDeleting.value = false
   }
 }
 
@@ -448,7 +531,9 @@ function overlayTheme(overlay: CitationProfileNode['overlay']) {
   return 'success'
 }
 
-onMounted(loadAll)
+watch(() => props.knowledgeBaseId, () => {
+  void loadAll()
+}, { immediate: true })
 </script>
 
 <style scoped lang="less">
@@ -632,7 +717,9 @@ onMounted(loadAll)
     flex-basis: 100%;
     width: 100%;
     max-width: none;
+    min-width: 0;
     height: auto;
+    box-sizing: border-box;
     border-left: 0;
     border-top: 1px solid var(--td-component-stroke);
   }

@@ -17,13 +17,13 @@ func TestCitationProfileSensitiveOperationGuard(t *testing.T) {
 	tests := []struct {
 		name       string
 		headers    map[string]string
-		issuedAt   *time.Time
+		authTime   *time.Time
 		apiKey     bool
 		wantStatus int
 	}{
 		{
 			name:     "fresh auth with same origin passes",
-			issuedAt: citationProfileTestTime(now.Add(-2 * time.Minute)),
+			authTime: citationProfileTestTime(now.Add(-2 * time.Minute)),
 			headers: map[string]string{
 				"Origin": "http://api.example.test",
 			},
@@ -31,7 +31,7 @@ func TestCitationProfileSensitiveOperationGuard(t *testing.T) {
 		},
 		{
 			name:     "fresh auth with csrf header passes without origin",
-			issuedAt: citationProfileTestTime(now.Add(-2 * time.Minute)),
+			authTime: citationProfileTestTime(now.Add(-2 * time.Minute)),
 			headers: map[string]string{
 				citationProfileCSRFHeader: "1",
 			},
@@ -39,7 +39,7 @@ func TestCitationProfileSensitiveOperationGuard(t *testing.T) {
 		},
 		{
 			name:     "cross origin without csrf header is rejected",
-			issuedAt: citationProfileTestTime(now.Add(-2 * time.Minute)),
+			authTime: citationProfileTestTime(now.Add(-2 * time.Minute)),
 			headers: map[string]string{
 				"Origin": "http://evil.example.test",
 			},
@@ -47,7 +47,7 @@ func TestCitationProfileSensitiveOperationGuard(t *testing.T) {
 		},
 		{
 			name:     "stale auth with same origin requires recent auth",
-			issuedAt: citationProfileTestTime(now.Add(-16 * time.Minute)),
+			authTime: citationProfileTestTime(now.Add(-16 * time.Minute)),
 			headers: map[string]string{
 				"Origin": "http://api.example.test",
 			},
@@ -73,14 +73,14 @@ func TestCitationProfileSensitiveOperationGuard(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			router := gin.New()
-			if tt.apiKey || tt.issuedAt != nil {
+			if tt.apiKey || tt.authTime != nil {
 				router.Use(func(c *gin.Context) {
 					ctx := c.Request.Context()
 					if tt.apiKey {
 						ctx = types.WithTenantAPIKeyScope(ctx, types.TenantAPIKeyScope{FullAccess: true})
 					}
-					if tt.issuedAt != nil {
-						ctx = types.WithAuthIssuedAt(ctx, *tt.issuedAt)
+					if tt.authTime != nil {
+						ctx = types.WithAuthTime(ctx, *tt.authTime)
 					}
 					c.Request = c.Request.WithContext(ctx)
 					c.Next()
@@ -110,7 +110,7 @@ func TestCitationProfileSensitiveOperationGuardRejectsSchemeMismatch(t *testing.
 	now := time.Date(2026, 9, 3, 1, 15, 0, 0, time.UTC)
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
-		ctx := types.WithAuthIssuedAt(c.Request.Context(), now.Add(-2*time.Minute))
+		ctx := types.WithAuthTime(c.Request.Context(), now.Add(-2*time.Minute))
 		c.Request = c.Request.WithContext(ctx)
 		c.Next()
 	})

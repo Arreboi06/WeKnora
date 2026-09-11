@@ -12,9 +12,12 @@ import {
 } from './citationProfile.ts'
 import {
   buildNodeStateByUuid,
+  CitationProfileRequestFence,
   correctionNeedsRefresh,
+  citationProfilePanelState,
   graphCapNotice,
   mergeRenamedNodesByUuid,
+  type CitationProfileNodeCard,
 } from '../../views/knowledge/wiki/citation-profile/model.ts'
 
 const calls: Array<{ method: string; url: string; body?: unknown; config?: unknown }> = []
@@ -84,7 +87,7 @@ test('client uses contract routes and keeps sensitive payloads scoped to the sig
     ['post', '/api/v1/knowledgebase/kb-1/citation-profile/corrections'],
     ['post', '/api/v1/knowledgebase/kb-1/citation-profile/exports'],
     ['get', '/api/v1/knowledgebase/kb-1/citation-profile/exports/operation-1'],
-    ['delete', '/api/v1/knowledgebase/kb-1/citation-profile'],
+    ['delete', '/api/v1/knowledgebase/kb-1/citation-profile/'],
     ['delete', '/api/v1/citation-profile/scopes/kb-1'],
   ])
 
@@ -107,7 +110,7 @@ test('guidance object is exact and unordered list is empty', () => {
 })
 
 test('page UUID remains the component identity when display fields change', () => {
-  const before = buildNodeStateByUuid([
+  const before = buildNodeStateByUuid<CitationProfileNodeCard>([
     { page_uuid: 'page-a', title: 'Old title', slug: 'old-slug', overlay: 'unknown' },
   ])
   const after = mergeRenamedNodesByUuid(before, [
@@ -135,6 +138,77 @@ test('graph cap notice points users to the complete node list', () => {
 test('read version conflict blocks stale correction action until refresh', () => {
   assert.equal(correctionNeedsRefresh('17', '17'), false)
   assert.equal(correctionNeedsRefresh('17', '18'), true)
+})
+
+test('deleted tombstone takes precedence over the fail-closed ACL empty state', () => {
+  assert.equal(citationProfilePanelState({
+    deleted: true,
+    enrolled: true,
+    suspended: true,
+    empty_state: { kind: 'acl_unknown', message_code: 'citation_profile_acl_unknown' },
+  }), 'deleted')
+})
+
+test('request fence rejects prior-KB and older same-lane responses without cancelling sibling reads', () => {
+  const fence = new CitationProfileRequestFence()
+  fence.reset('kb-a')
+  const aStatus = fence.begin('status')
+  const aNodes = fence.begin('nodes')
+  const aGraph = fence.begin('graph')
+
+  fence.reset('kb-b')
+  const bStatus = fence.begin('status')
+  const bNodesFirst = fence.begin('nodes')
+  const bGraph = fence.begin('graph')
+  const bNodesSecond = fence.begin('nodes')
+
+  assert.equal(fence.isCurrent(aStatus, 'kb-b'), false)
+  assert.equal(fence.isCurrent(aNodes, 'kb-b'), false)
+  assert.equal(fence.isCurrent(aGraph, 'kb-b'), false)
+  assert.equal(fence.isCurrent(bStatus, 'kb-b'), true)
+  assert.equal(fence.isCurrent(bGraph, 'kb-b'), true)
+  assert.equal(fence.isCurrent(bNodesFirst, 'kb-b'), false)
+  assert.equal(fence.isCurrent(bNodesSecond, 'kb-b'), true)
+
+  fence.reset('kb-b')
+  assert.equal(fence.isCurrent(bStatus, 'kb-b'), false,
+    'a same-KB refresh must fence every response from the previous generation')
+})
+
+test('correction continuation validates the loadAll generation before reopening evidence', () => {
+  const here = dirname(fileURLToPath(import.meta.url))
+  const panel = readFileSync(
+    join(here, '../../views/knowledge/wiki/citation-profile/CitationProfilePanel.vue'),
+    'utf8',
+  )
+  assert.match(panel, /const reloadToken = await loadAll\(\)/)
+  assert.match(
+    panel,
+    /requestFence\.isCurrent\(reloadToken, props\.knowledgeBaseId\)[\s\S]{0,180}reopenDrawer/,
+    'a superseding same-KB refresh must stop an older correction continuation from reopening the drawer',
+  )
+})
+
+test('blind delete fences in-flight reads and clears every retained sensitive snapshot', () => {
+  const here = dirname(fileURLToPath(import.meta.url))
+  const panel = readFileSync(
+    join(here, '../../views/knowledge/wiki/citation-profile/CitationProfilePanel.vue'),
+    'utf8',
+  )
+  const blindDeleteBody = panel.match(/async function blindDelete\(\) \{([\s\S]*?)\n\}/)?.[1] || ''
+
+  assert.match(blindDeleteBody, /requestFence\.reset\(knowledgeBaseId\)/)
+  assert.match(blindDeleteBody, /resetPanelState\(\)/)
+  assert.doesNotMatch(
+    blindDeleteBody,
+    /loadAll\(/,
+    'an existence-hiding delete must not perform a revealing status refresh',
+  )
+
+  const resetBody = panel.match(/function resetPanelState\(\) \{([\s\S]*?)\n\}/)?.[1] || ''
+  for (const sensitiveRef of ['status', 'nodes', 'nextCursor', 'graph', 'evidence', 'selectedNode']) {
+    assert.match(resetBody, new RegExp(`${sensitiveRef}\\.value\\s*=\\s*(?:null|\\[\\])`), sensitiveRef)
+  }
 })
 
 test('new citation profile files keep prohibited wording out of source', () => {

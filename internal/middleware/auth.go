@@ -104,11 +104,12 @@ func isTenantOptionalAPI(path, method string) bool {
 	}
 }
 
-func attachTenantlessUserContext(c *gin.Context, user *types.User) {
+func attachTenantlessUserContext(c *gin.Context, user *types.User, authTime *time.Time) {
 	applyAuthSession(c, authSession{
 		User:        user,
 		Principal:   types.Principal{Type: types.PrincipalWebUser, ID: user.ID},
 		SystemAdmin: user.IsSystemAdmin,
+		AuthTime:    authTime,
 	})
 }
 
@@ -149,7 +150,7 @@ func Auth(
 			bearerPresented = true
 			user, jwtTenantID, err := userService.ValidateToken(c.Request.Context(), token)
 			if err == nil && user != nil {
-				if authenticateJWTUser(c, tenantService, memberService, cfg, user, jwtTenantID, authTokenIssuedAt(token)) {
+				if authenticateJWTUser(c, tenantService, memberService, cfg, user, jwtTenantID, authTokenAuthTime(token)) {
 					c.Next()
 				}
 				return
@@ -189,20 +190,20 @@ func bearerToken(c *gin.Context) (string, bool) {
 	return strings.TrimPrefix(authHeader, "Bearer "), true
 }
 
-func authTokenIssuedAt(tokenString string) *time.Time {
+func authTokenAuthTime(tokenString string) *time.Time {
 	claims := jwt.MapClaims{}
 	if _, _, err := jwt.NewParser().ParseUnverified(tokenString, claims); err != nil {
 		return nil
 	}
-	issuedAt, ok := authIssuedAtFromClaims(claims)
+	authTime, ok := authTimeFromClaims(claims)
 	if !ok {
 		return nil
 	}
-	return &issuedAt
+	return &authTime
 }
 
-func authIssuedAtFromClaims(claims jwt.MapClaims) (time.Time, bool) {
-	raw, ok := claims["iat"]
+func authTimeFromClaims(claims jwt.MapClaims) (time.Time, bool) {
+	raw, ok := claims["auth_time"]
 	if !ok {
 		return time.Time{}, false
 	}
@@ -235,7 +236,7 @@ func authenticateJWTUser(
 	cfg *config.Config,
 	user *types.User,
 	jwtTenantID uint64,
-	authIssuedAt *time.Time,
+	authTime *time.Time,
 ) bool {
 	ctx := c.Request.Context()
 
@@ -248,7 +249,7 @@ func authenticateJWTUser(
 		// 无可用空间：身份级路由（/auth/me 等）放行为 tenantless 会话，
 		// 其余路由返回 TENANT_REQUIRED 让前端引导用户创建/加入空间。
 		if isTenantOptionalAPI(c.Request.URL.Path, c.Request.Method) {
-			attachTenantlessUserContext(c, user)
+			attachTenantlessUserContext(c, user, authTime)
 			return true
 		}
 		c.JSON(http.StatusConflict, gin.H{
@@ -291,13 +292,13 @@ func authenticateJWTUser(
 		"[auth] resolved role=%s for user=%s in tenant=%d (jwt_tenant=%d, header=%q, cross_switch=%v)",
 		role, user.ID, targetTenantID, jwtTenantID, c.GetHeader("X-Tenant-ID"), crossTenantSwitch)
 	applyAuthSession(c, authSession{
-		User:         user,
-		Principal:    types.Principal{Type: types.PrincipalWebUser, ID: user.ID},
-		TenantID:     targetTenantID,
-		Tenant:       tenant,
-		Role:         role,
-		SystemAdmin:  user.IsSystemAdmin,
-		AuthIssuedAt: authIssuedAt,
+		User:        user,
+		Principal:   types.Principal{Type: types.PrincipalWebUser, ID: user.ID},
+		TenantID:    targetTenantID,
+		Tenant:      tenant,
+		Role:        role,
+		SystemAdmin: user.IsSystemAdmin,
+		AuthTime:    authTime,
 	})
 	return true
 }

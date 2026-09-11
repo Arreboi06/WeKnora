@@ -81,7 +81,7 @@ func TestApplyAuthSessionTenantless(t *testing.T) {
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/auth/me", nil)
 
-	attachTenantlessUserContext(c, &types.User{ID: "u2"})
+	attachTenantlessUserContext(c, &types.User{ID: "u2"}, nil)
 
 	ctx := c.Request.Context()
 	if _, ok := types.TenantIDFromContext(ctx); ok {

@@ -318,7 +318,9 @@ func writeWikiFolderError(c *gin.Context, err error) {
 	switch {
 	case stderrors.Is(err, repository.ErrWikiFolderNotFound), stderrors.Is(err, repository.ErrWikiPageNotFound):
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-	case stderrors.Is(err, repository.ErrWikiFolderConflict), stderrors.Is(err, repository.ErrWikiFolderNotEmpty):
+	case stderrors.Is(err, repository.ErrWikiFolderConflict),
+		stderrors.Is(err, repository.ErrWikiFolderNotEmpty),
+		stderrors.Is(err, repository.ErrWikiPageConflict):
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 	default:
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})

@@ -3,6 +3,8 @@ package repository
 import (
 	"context"
 	"errors"
+	"strings"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -21,12 +23,13 @@ var (
 
 // userRepository implements user repository interface
 type userRepository struct {
-	db *gorm.DB
+	db                 *gorm.DB
+	citationProfileACL citationProfileACLInvalidationGate
 }
 
 // NewUserRepository creates a new user repository
-func NewUserRepository(db *gorm.DB) interfaces.UserRepository {
-	return &userRepository{db: db}
+func NewUserRepository(db *gorm.DB, citationProfileConfig *types.CitationProfileConfig) interfaces.UserRepository {
+	return &userRepository{db: db, citationProfileACL: newCitationProfileACLInvalidationGate(citationProfileConfig)}
 }
 
 // CreateUser creates a user
@@ -130,7 +133,19 @@ func (r *userRepository) UpdateUser(ctx context.Context, user *types.User) error
 
 // DeleteUser deletes a user
 func (r *userRepository) DeleteUser(ctx context.Context, id string) error {
-	return r.db.WithContext(ctx).Where("id = ?", id).Delete(&types.User{}).Error
+	userID := strings.TrimSpace(id)
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("id = ?", userID).Delete(&types.User{}).Error; err != nil {
+			return err
+		}
+		if userID == "" {
+			return nil
+		}
+		return r.citationProfileACL.invalidate(tx, types.CitationProfileACLMutation{
+			PrincipalType: types.PrincipalWebUser,
+			PrincipalID:   userID,
+		}, time.Now().UTC())
+	})
 }
 
 // ListUsers lists users with pagination

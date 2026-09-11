@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -157,7 +158,7 @@ func TestSkillPythonVerifier(t *testing.T) {
 		// (the line is a note, not a failure). Either way the install proceeds.
 		name: "a requirement gated by an environment marker",
 		files: map[string]string{
-			"requirements.txt": "pywin32; sys_platform == \"win32\"\n" +
+			"requirements.txt": "pywin32; sys_platform == \"__never__\"\n" +
 				"totally_absent_package; extra == \"dev\"\n",
 			"scripts/run.py": "x = 1\n",
 		},
@@ -337,6 +338,9 @@ func TestSkillPythonVerifierNeverExecutesTheSkill(t *testing.T) {
 // The skill tree is owned by root and readable by everyone; a file the
 // execution user cannot open is an install that would fail on first use.
 func TestSkillPythonVerifierReportsAnUnreadableScript(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not enforce POSIX mode 000 as an unreadable-file boundary")
+	}
 	if os.Geteuid() == 0 {
 		t.Skip("root can read a 000 file, so this states nothing when tests run as root")
 	}

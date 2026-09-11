@@ -339,7 +339,7 @@ func TestManagerKeepsPreloadedSkillExecutionWhenNoTenantSource(t *testing.T) {
 	require.NotNil(t, sandboxMgr.config)
 	require.Empty(t, sandboxMgr.config.RemoteScriptPath)
 	require.Equal(t, filepath.Join(dir, "pdf", "scripts", "run.py"), sandboxMgr.config.Script)
-	require.Equal(t, dir+"/pdf", sandboxMgr.config.WorkDir)
+	require.Equal(t, filepath.Join(dir, "pdf"), sandboxMgr.config.WorkDir)
 }
 
 type recordingSandboxManager struct {

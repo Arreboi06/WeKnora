@@ -28,12 +28,13 @@ func forUpdateClause() clause.Expression {
 
 // tenantMemberRepository implements interfaces.TenantMemberRepository.
 type tenantMemberRepository struct {
-	db *gorm.DB
+	db                 *gorm.DB
+	citationProfileACL citationProfileACLInvalidationGate
 }
 
 // NewTenantMemberRepository creates a new tenant member repository.
-func NewTenantMemberRepository(db *gorm.DB) interfaces.TenantMemberRepository {
-	return &tenantMemberRepository{db: db}
+func NewTenantMemberRepository(db *gorm.DB, citationProfileConfig *types.CitationProfileConfig) interfaces.TenantMemberRepository {
+	return &tenantMemberRepository{db: db, citationProfileACL: newCitationProfileACLInvalidationGate(citationProfileConfig)}
 }
 
 // Create inserts a new active membership row. Status defaults to
@@ -46,7 +47,16 @@ func (r *tenantMemberRepository) Create(ctx context.Context, member *types.Tenan
 	if member.JoinedAt.IsZero() {
 		member.JoinedAt = time.Now()
 	}
-	return r.db.WithContext(ctx).Create(member).Error
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(member).Error; err != nil {
+			return err
+		}
+		return r.citationProfileACL.invalidate(tx, types.CitationProfileACLMutation{
+			PrincipalType:         types.PrincipalWebUser,
+			PrincipalID:           member.UserID,
+			AuthenticatedTenantID: member.TenantID,
+		}, time.Now().UTC())
+	})
 }
 
 // Get returns the active membership for (userID, tenantID), or (nil, nil)
@@ -145,28 +155,40 @@ func (r *tenantMemberRepository) ListPagedByTenant(
 
 // UpdateRole changes the role of an existing active membership.
 func (r *tenantMemberRepository) UpdateRole(ctx context.Context, userID string, tenantID uint64, role types.TenantRole) error {
-	res := r.db.WithContext(ctx).
-		Model(&types.TenantMember{}).
-		Where("user_id = ? AND tenant_id = ?", userID, tenantID).
-		Updates(map[string]any{
-			"role":       role,
-			"updated_at": time.Now(),
-		})
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
-	}
-	return nil
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		now := time.Now().UTC()
+		res := tx.Model(&types.TenantMember{}).
+			Where("user_id = ? AND tenant_id = ?", userID, tenantID).
+			Updates(map[string]any{"role": role, "updated_at": now})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return gorm.ErrRecordNotFound
+		}
+		return r.citationProfileACL.invalidate(tx, types.CitationProfileACLMutation{
+			PrincipalType:         types.PrincipalWebUser,
+			PrincipalID:           userID,
+			AuthenticatedTenantID: tenantID,
+		}, now)
+	})
 }
 
 // SoftDelete marks the membership row as deleted. GORM's soft-delete
 // support populates DeletedAt automatically.
 func (r *tenantMemberRepository) SoftDelete(ctx context.Context, userID string, tenantID uint64) error {
-	return r.db.WithContext(ctx).
-		Where("user_id = ? AND tenant_id = ?", userID, tenantID).
-		Delete(&types.TenantMember{}).Error
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Where("user_id = ? AND tenant_id = ?", userID, tenantID).
+			Delete(&types.TenantMember{})
+		if result.Error != nil {
+			return result.Error
+		}
+		return r.citationProfileACL.invalidate(tx, types.CitationProfileACLMutation{
+			PrincipalType:         types.PrincipalWebUser,
+			PrincipalID:           userID,
+			AuthenticatedTenantID: tenantID,
+		}, time.Now().UTC())
+	})
 }
 
 // CountActiveOwners reports the number of active owner rows in the tenant.
@@ -231,7 +253,11 @@ func (r *tenantMemberRepository) DemoteOwnerAtomically(
 		if res.RowsAffected == 0 {
 			return gorm.ErrRecordNotFound
 		}
-		return nil
+		return r.citationProfileACL.invalidate(tx, types.CitationProfileACLMutation{
+			PrincipalType:         types.PrincipalWebUser,
+			PrincipalID:           userID,
+			AuthenticatedTenantID: tenantID,
+		}, time.Now().UTC())
 	})
 }
 
@@ -264,7 +290,11 @@ func (r *tenantMemberRepository) RemoveOwnerAtomically(
 		if res.RowsAffected == 0 {
 			return gorm.ErrRecordNotFound
 		}
-		return nil
+		return r.citationProfileACL.invalidate(tx, types.CitationProfileACLMutation{
+			PrincipalType:         types.PrincipalWebUser,
+			PrincipalID:           userID,
+			AuthenticatedTenantID: tenantID,
+		}, time.Now().UTC())
 	})
 }
 

@@ -37,8 +37,8 @@ func citationProfileSensitiveOperationGuardWithClock(now func() time.Time) gin.H
 			c.Abort()
 			return
 		}
-		issuedAt, ok := types.AuthIssuedAtFromContext(c.Request.Context())
-		if !ok || !citationProfileIssuedAtRecent(issuedAt, now().UTC()) {
+		authTime, ok := types.AuthTimeFromContext(c.Request.Context())
+		if !ok || !citationProfileAuthTimeRecent(authTime, now().UTC()) {
 			c.JSON(http.StatusUnauthorized, gin.H{
 				"error": "Unauthorized: recent authentication required",
 				"code":  "CITATION_PROFILE_RECENT_AUTH_REQUIRED",
@@ -87,11 +87,11 @@ func citationProfileRequestScheme(req *http.Request) string {
 	return "http"
 }
 
-func citationProfileIssuedAtRecent(issuedAt, now time.Time) bool {
-	issuedAt = issuedAt.UTC()
+func citationProfileAuthTimeRecent(authTime, now time.Time) bool {
+	authTime = authTime.UTC()
 	now = now.UTC()
-	if issuedAt.After(now.Add(citationProfileRecentAuthClockSkew)) {
+	if authTime.After(now.Add(citationProfileRecentAuthClockSkew)) {
 		return false
 	}
-	return !issuedAt.Before(now.Add(-citationProfileRecentAuthWindow))
+	return !authTime.Before(now.Add(-citationProfileRecentAuthWindow))
 }

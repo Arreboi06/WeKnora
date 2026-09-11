@@ -3,10 +3,13 @@ package repository
 import (
 	"context"
 	"errors"
+	"sort"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var (
@@ -16,25 +19,33 @@ var (
 
 // agentShareRepository implements AgentShareRepository interface
 type agentShareRepository struct {
-	db *gorm.DB
+	db                 *gorm.DB
+	citationProfileACL citationProfileACLInvalidationGate
 }
 
 // NewAgentShareRepository creates a new agent share repository
-func NewAgentShareRepository(db *gorm.DB) interfaces.AgentShareRepository {
-	return &agentShareRepository{db: db}
+func NewAgentShareRepository(db *gorm.DB, citationProfileConfig *types.CitationProfileConfig) interfaces.AgentShareRepository {
+	return &agentShareRepository{db: db, citationProfileACL: newCitationProfileACLInvalidationGate(citationProfileConfig)}
 }
 
 // Create creates a new agent share record
 func (r *agentShareRepository) Create(ctx context.Context, share *types.AgentShare) error {
-	var count int64
-	r.db.WithContext(ctx).Model(&types.AgentShare{}).
-		Where("agent_id = ? AND source_tenant_id = ? AND organization_id = ? AND deleted_at IS NULL",
-			share.AgentID, share.SourceTenantID, share.OrganizationID).
-		Count(&count)
-	if count > 0 {
-		return ErrAgentShareAlreadyExists
-	}
-	return r.db.WithContext(ctx).Create(share).Error
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var count int64
+		if err := tx.Model(&types.AgentShare{}).
+			Where("agent_id = ? AND source_tenant_id = ? AND organization_id = ? AND deleted_at IS NULL",
+				share.AgentID, share.SourceTenantID, share.OrganizationID).
+			Count(&count).Error; err != nil {
+			return err
+		}
+		if count > 0 {
+			return ErrAgentShareAlreadyExists
+		}
+		if err := tx.Create(share).Error; err != nil {
+			return err
+		}
+		return r.citationProfileACL.invalidate(tx, citationProfileAgentShareMutation(share), time.Now().UTC())
+	})
 }
 
 // GetByID gets a share record by ID
@@ -67,25 +78,103 @@ func (r *agentShareRepository) GetByAgentAndOrg(ctx context.Context, agentID str
 
 // Update updates a share record
 func (r *agentShareRepository) Update(ctx context.Context, share *types.AgentShare) error {
-	return r.db.WithContext(ctx).Model(&types.AgentShare{}).
-		Where("id = ?", share.ID).Updates(share).Error
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var previous types.AgentShare
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", share.ID).First(&previous).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		if err := tx.Model(&types.AgentShare{}).Where("id = ?", share.ID).Updates(share).Error; err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		mutations := []types.CitationProfileACLMutation{citationProfileAgentShareMutation(&previous)}
+		if previous.SourceTenantID != share.SourceTenantID || previous.AgentID != share.AgentID {
+			mutations = append(mutations, citationProfileAgentShareMutation(share))
+		}
+		return r.citationProfileACL.invalidateMany(tx, mutations, now)
+	})
 }
 
 // Delete soft deletes a share record
 func (r *agentShareRepository) Delete(ctx context.Context, id string) error {
-	return r.db.WithContext(ctx).Where("id = ?", id).Delete(&types.AgentShare{}).Error
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var share types.AgentShare
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", id).First(&share).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		if err := tx.Where("id = ?", id).Delete(&types.AgentShare{}).Error; err != nil {
+			return err
+		}
+		return r.citationProfileACL.invalidate(tx, citationProfileAgentShareMutation(&share), time.Now().UTC())
+	})
 }
 
 // DeleteByAgentIDAndSourceTenant soft deletes all share records for an agent (id, tenant_id)
 func (r *agentShareRepository) DeleteByAgentIDAndSourceTenant(ctx context.Context, agentID string, sourceTenantID uint64) error {
-	return r.db.WithContext(ctx).
-		Where("agent_id = ? AND source_tenant_id = ?", agentID, sourceTenantID).
-		Delete(&types.AgentShare{}).Error
+	return r.deleteCitationProfileAgentShares(ctx, "agent_id = ? AND source_tenant_id = ?", agentID, sourceTenantID)
 }
 
 // DeleteByOrganizationID soft deletes all share records for an organization
 func (r *agentShareRepository) DeleteByOrganizationID(ctx context.Context, orgID string) error {
-	return r.db.WithContext(ctx).Where("organization_id = ?", orgID).Delete(&types.AgentShare{}).Error
+	return r.deleteCitationProfileAgentShares(ctx, "organization_id = ?", orgID)
+}
+
+func (r *agentShareRepository) deleteCitationProfileAgentShares(ctx context.Context, predicate string, values ...interface{}) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var shares []types.AgentShare
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where(predicate, values...).
+			Order("source_tenant_id ASC").Order("agent_id ASC").Order("id ASC").
+			Find(&shares).Error; err != nil {
+			return err
+		}
+		if err := tx.Where(predicate, values...).Delete(&types.AgentShare{}).Error; err != nil {
+			return err
+		}
+		sort.Slice(shares, func(i, j int) bool {
+			if shares[i].SourceTenantID != shares[j].SourceTenantID {
+				return shares[i].SourceTenantID < shares[j].SourceTenantID
+			}
+			if shares[i].AgentID != shares[j].AgentID {
+				return shares[i].AgentID < shares[j].AgentID
+			}
+			return shares[i].ID < shares[j].ID
+		})
+		now := time.Now().UTC()
+		mutations := make([]types.CitationProfileACLMutation, 0, len(shares))
+		var lastSource uint64
+		var lastAgent string
+		for i := range shares {
+			if i > 0 && shares[i].SourceTenantID == lastSource && shares[i].AgentID == lastAgent {
+				continue
+			}
+			mutations = append(mutations, citationProfileAgentShareMutation(&shares[i]))
+			lastSource = shares[i].SourceTenantID
+			lastAgent = shares[i].AgentID
+		}
+		if len(mutations) == 0 {
+			return nil
+		}
+		return r.citationProfileACL.invalidateMany(tx, mutations, now)
+	})
+}
+
+func invalidateCitationProfileAgentShareTx(tx *gorm.DB, share *types.AgentShare, now time.Time) error {
+	return invalidateCitationProfileACLTx(tx, citationProfileAgentShareMutation(share), now)
+}
+
+func citationProfileAgentShareMutation(share *types.AgentShare) types.CitationProfileACLMutation {
+	return types.CitationProfileACLMutation{
+		SourceTenantID: share.SourceTenantID,
+		AccessPath:     types.CitationProfileACLAccessPathAgentShare,
+		AccessPathID:   share.AgentID,
+	}
 }
 
 // ListByAgent lists all share records for an agent
@@ -194,6 +283,8 @@ func (r *agentShareRepository) GetShareByAgentIDForTenant(ctx context.Context, t
 	var share types.AgentShare
 	tx := r.db.WithContext(ctx).
 		Joins("JOIN organization_tenant_members otm ON otm.organization_id = agent_shares.organization_id").
+		Joins("JOIN organizations ON organizations.id = agent_shares.organization_id AND organizations.deleted_at IS NULL").
+		Joins("JOIN custom_agents ON custom_agents.id = agent_shares.agent_id AND custom_agents.tenant_id = agent_shares.source_tenant_id AND custom_agents.deleted_at IS NULL").
 		Where("agent_shares.agent_id = ?", agentID).
 		Where("otm.tenant_id = ?", tenantID).
 		Where("agent_shares.source_tenant_id != ?", excludeTenantID).

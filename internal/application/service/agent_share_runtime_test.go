@@ -152,3 +152,19 @@ func TestSharedAgentInfoLeavesCustomAgentName(t *testing.T) {
 	require.Equal(t, "Mine", info.Agent.Name)
 	require.Equal(t, "keep me", info.Agent.Description)
 }
+
+func TestSelectSharedAgentForKBReturnsDeterministicConcreteProof(t *testing.T) {
+	kb := &types.KnowledgeBase{ID: "kb-proof", TenantID: 200}
+	selected := selectSharedAgentForKB([]*types.SharedAgentInfo{
+		{Agent: &types.CustomAgent{ID: "", TenantID: 200, Config: types.CustomAgentConfig{KBSelectionMode: "all"}}},
+		{Agent: &types.CustomAgent{ID: "agent-wrong-tenant", TenantID: 999, Config: types.CustomAgentConfig{KBSelectionMode: "all"}}},
+		{Agent: &types.CustomAgent{ID: "agent-none", TenantID: 200, Config: types.CustomAgentConfig{KBSelectionMode: "none"}}},
+		{Agent: &types.CustomAgent{ID: "agent-miss", TenantID: 200, Config: types.CustomAgentConfig{KBSelectionMode: "selected", KnowledgeBases: []string{"other"}}}},
+		{Agent: &types.CustomAgent{ID: "agent-z", TenantID: 200, Config: types.CustomAgentConfig{KBSelectionMode: "all"}}},
+		{Agent: &types.CustomAgent{ID: "agent-a", TenantID: 200, Config: types.CustomAgentConfig{KBSelectionMode: "selected", KnowledgeBases: []string{"other", kb.ID}}}},
+	}, kb)
+
+	require.NotNil(t, selected)
+	require.Equal(t, "agent-a", selected.ID,
+		"input/list ordering must not change the durable ACL proof selected by different nodes")
+}

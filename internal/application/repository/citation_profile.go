@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -21,6 +22,8 @@ type citationProfileRepository struct {
 	db *gorm.DB
 }
 
+var errCitationProfileBlindDeleteRace = errors.New("citation profile blind delete raced with a terminal scope change")
+
 func NewCitationProfileRepository(db *gorm.DB) interfaces.CitationProfileRepository {
 	return &citationProfileRepository{db: db}
 }
@@ -34,9 +37,23 @@ func (r *citationProfileRepository) GetScopeStatus(
 	if r == nil || r.db == nil {
 		return nil, errors.New("citation profile repository requires database")
 	}
+	currentACLWhere, currentACLArgs, err := citationProfileACLCurrentDatabaseSQL(
+		"citation_profile_scopes",
+		r.db.Dialector.Name(),
+	)
+	if err != nil {
+		return nil, err
+	}
+	selectArgs := make([]interface{}, 0, len(currentACLArgs)+1)
+	selectArgs = append(selectArgs, true)
+	selectArgs = append(selectArgs, currentACLArgs...)
+	projection := "citation_profile_scopes.*, CASE WHEN citation_profile_scopes.enabled = ? " +
+		"AND citation_profile_scopes.deleted_at IS NULL AND citation_profile_scopes.fenced_at IS NULL AND " +
+		currentACLWhere + " THEN TRUE ELSE FALSE END AS acl_current"
 
 	var scope types.CitationProfileScope
-	err := r.db.WithContext(ctx).
+	err = r.db.WithContext(ctx).
+		Select(projection, selectArgs...).
 		Where("tenant_id = ? AND subject_id = ? AND knowledge_base_id = ?", tenantID, subjectID, kbID).
 		Order("CASE WHEN deleted_at IS NULL THEN 0 ELSE 1 END").
 		Order("updated_at DESC").
@@ -68,6 +85,14 @@ func (r *citationProfileRepository) SetEnrollment(
 	if tenantID == 0 || subjectID == "" || kbID == "" || idempotencyKey == "" {
 		return nil, fmt.Errorf("%w: enrollment requires scope and idempotency", types.ErrCitationProfileInvalidRequest)
 	}
+	var aclBinding types.CitationProfileACLBinding
+	if enabled {
+		var ok bool
+		aclBinding, ok = types.CitationProfileACLBindingFromContext(ctx)
+		if !ok || !citationProfileACLBindingMatchesContext(ctx, tenantID, subjectID, kbID, aclBinding) {
+			return nil, fmt.Errorf("%w: enrollment requires server-derived ACL binding", types.ErrCitationProfileUnavailable)
+		}
+	}
 
 	expectedText := ""
 	if expectedReadVersion != nil {
@@ -76,17 +101,35 @@ func (r *citationProfileRepository) SetEnrollment(
 	requestDigest := citationRequestDigest(types.CitationOperationEnrollment, kbID, fmt.Sprintf("%t", enabled), expectedText)
 
 	var resolved *types.CitationProfileScope
+	var verifiedExistingScope *types.CitationProfileScope
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		scope, err := r.loadLiveCitationScopeForUpdate(tx, tenantID, subjectID, kbID)
 		if err != nil {
 			return err
 		}
-		now := time.Now().UTC()
+		now, err := citationProfileDatabaseNow(tx)
+		if err != nil {
+			return err
+		}
+		retiredFencedScope := false
 
 		if scope != nil {
 			if scope.FencedAt != nil {
-				return types.ErrCitationProfileDeleted
+				if !enabled {
+					return types.ErrCitationProfileDeleted
+				}
+				if expectedReadVersion != nil && *expectedReadVersion != 0 && scope.ProfileReadVersion != *expectedReadVersion {
+					return types.ErrCitationProfileChanged
+				}
+				if err := r.retireCitationProfileFencedScopeForReenrollment(tx, scope, now); err != nil {
+					return err
+				}
+				scope = nil
+				retiredFencedScope = true
 			}
+		}
+
+		if scope != nil {
 			if existing, found, err := r.findCitationProfileOperationByIdem(
 				tx, tenantID, subjectID, kbID, scope.SubjectEpoch, types.CitationOperationEnrollment, idempotencyKey, requestDigest,
 			); err != nil {
@@ -101,15 +144,27 @@ func (r *citationProfileRepository) SetEnrollment(
 					return err
 				}
 				resolved = replayed
+				if replayed.ACLCheckState == types.CitationProfileACLStateCurrent {
+					if err := r.ensureCitationProfileACLCurrentTx(tx, replayed); err != nil {
+						return err
+					}
+					snapshot := *replayed
+					verifiedExistingScope = &snapshot
+				}
 				return nil
 			}
 			if expectedReadVersion != nil && scope.ProfileReadVersion != *expectedReadVersion {
 				return types.ErrCitationProfileChanged
 			}
+			if enabled && !citationProfileScopeACLBindingEqual(scope, aclBinding) {
+				if err := r.refreshCitationProfileACLBinding(tx, scope, aclBinding, now); err != nil {
+					return err
+				}
+			}
 			if !enabled {
 				resultSummary, err := citationProfileOperationResult(scope, map[string]interface{}{
 					"enabled":      false,
-					"receipt_code": types.CitationProfileReceiptHiddenPurgeScheduled,
+					"receipt_code": types.CitationProfileReceiptHiddenAndFenced,
 					"hidden_at":    citationTime(now),
 				}, now)
 				if err != nil {
@@ -129,6 +184,13 @@ func (r *citationProfileRepository) SetEnrollment(
 				return nil
 			}
 			if scope.Enabled {
+				if scope.ACLCheckState == types.CitationProfileACLStateCurrent {
+					if err := r.ensureCitationProfileACLCurrentTx(tx, scope); err != nil {
+						return err
+					}
+					snapshot := *scope
+					verifiedExistingScope = &snapshot
+				}
 				resultSummary, err := citationProfileOperationResult(scope, map[string]interface{}{"enabled": true}, now)
 				if err != nil {
 					return err
@@ -149,7 +211,7 @@ func (r *citationProfileRepository) SetEnrollment(
 			}
 		}
 
-		if expectedReadVersion != nil && *expectedReadVersion != 0 {
+		if expectedReadVersion != nil && *expectedReadVersion != 0 && !retiredFencedScope {
 			return types.ErrCitationProfileChanged
 		}
 		if !enabled {
@@ -167,18 +229,26 @@ func (r *citationProfileRepository) SetEnrollment(
 			return types.ErrCitationProfileQuotaExceeded
 		}
 		scope = &types.CitationProfileScope{
-			ID:                     uuid.NewString(),
-			TenantID:               tenantID,
-			SubjectID:              subjectID,
-			KnowledgeBaseID:        kbID,
-			SubjectEpoch:           uuid.NewString(),
-			ProfileReadVersion:     1,
-			ProfilePolicyVersion:   types.CitationProfilePolicyVersion,
-			RetentionPolicyVersion: types.CitationProfileRetentionPolicyVersion,
-			Enabled:                true,
-			ACLCheckState:          types.CitationProfileACLStateCurrent,
-			CreatedAt:              now,
-			UpdatedAt:              now,
+			ID:                       uuid.NewString(),
+			TenantID:                 tenantID,
+			SubjectID:                subjectID,
+			KnowledgeBaseID:          kbID,
+			SubjectEpoch:             uuid.NewString(),
+			ProfileReadVersion:       1,
+			ProfilePolicyVersion:     types.CitationProfilePolicyVersion,
+			RetentionPolicyVersion:   types.CitationProfileRetentionPolicyVersion,
+			Enabled:                  true,
+			ACLCheckState:            types.CitationProfileACLStateUnknown,
+			NextACLCheckAt:           citationTimePointer(now),
+			ACLPrincipalType:         aclBinding.PrincipalType,
+			ACLPrincipalID:           aclBinding.PrincipalID,
+			ACLAuthenticatedTenantID: aclBinding.AuthenticatedTenantID,
+			ACLAPIKeyID:              aclBinding.APIKeyID,
+			ACLAccessPath:            aclBinding.AccessPath,
+			ACLAccessPathID:          aclBinding.AccessPathID,
+			ACLGeneration:            1,
+			CreatedAt:                now,
+			UpdatedAt:                now,
 		}
 		if err := tx.Create(scope).Error; err != nil {
 			return err
@@ -198,7 +268,137 @@ func (r *citationProfileRepository) SetEnrollment(
 		resolved = scope
 		return nil
 	})
-	return resolved, err
+	if err != nil {
+		return nil, err
+	}
+	if verifiedExistingScope != nil {
+		if err := r.verifyCitationProfileReadSnapshotFresh(ctx, verifiedExistingScope); err != nil {
+			return nil, err
+		}
+	}
+	return resolved, nil
+}
+
+func (r *citationProfileRepository) retireCitationProfileFencedScopeForReenrollment(
+	tx *gorm.DB,
+	scope *types.CitationProfileScope,
+	now time.Time,
+) error {
+	if scope == nil || scope.FencedAt == nil || scope.DeletedAt != nil {
+		return types.ErrCitationProfileChanged
+	}
+	nextVersion := scope.ProfileReadVersion + 1
+	result := tx.Model(&types.CitationProfileScope{}).
+		Where("id = ? AND tenant_id = ? AND subject_id = ? AND knowledge_base_id = ? AND subject_epoch = ? AND deleted_at IS NULL AND fenced_at IS NOT NULL",
+			scope.ID, scope.TenantID, scope.SubjectID, scope.KnowledgeBaseID, scope.SubjectEpoch).
+		Where("profile_read_version = ?", scope.ProfileReadVersion).
+		Updates(map[string]interface{}{
+			"deleted_at":           now,
+			"profile_read_version": nextVersion,
+			"updated_at":           now,
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return types.ErrCitationProfileChanged
+	}
+	if err := terminateCitationProfileWorkForDelete(tx, scope, now); err != nil {
+		return err
+	}
+	if err := revokeCitationProfileExportsForScope(tx, scope, now); err != nil {
+		return err
+	}
+	scope.DeletedAt = &now
+	scope.ProfileReadVersion = nextVersion
+	scope.UpdatedAt = now
+	return nil
+}
+
+func citationProfileACLBindingMatchesContext(ctx context.Context, tenantID uint64, subjectID, kbID string, binding types.CitationProfileACLBinding) bool {
+	binding = binding.Normalize()
+	if !binding.Valid() || strings.TrimSpace(types.SessionOwnerIDFromContext(ctx)) != subjectID {
+		return false
+	}
+	if authenticatedTenantID, ok := types.AuthenticatedTenantIDFromContext(ctx); !ok || authenticatedTenantID != binding.AuthenticatedTenantID {
+		return false
+	}
+	if binding.AccessPath == types.CitationProfileACLAccessPathOwner && binding.AuthenticatedTenantID != tenantID {
+		return false
+	}
+	if binding.AccessPath == types.CitationProfileACLAccessPathKBShare && binding.AccessPathID != kbID {
+		return false
+	}
+	principal, ok := types.PrincipalFromContext(ctx)
+	if !ok || principal.Type != binding.PrincipalType || principal.ID != binding.PrincipalID {
+		return false
+	}
+	apiScope, hasAPIKey := types.TenantAPIKeyScopeFromContext(ctx)
+	if binding.APIKeyID != 0 {
+		return hasAPIKey && apiScope.KeyID == binding.APIKeyID
+	}
+	return !hasAPIKey || apiScope.KeyID == 0
+}
+
+func citationProfileScopeACLBindingEqual(scope *types.CitationProfileScope, binding types.CitationProfileACLBinding) bool {
+	return scope != nil &&
+		scope.ACLPrincipalType == binding.PrincipalType &&
+		scope.ACLPrincipalID == binding.PrincipalID &&
+		scope.ACLAuthenticatedTenantID == binding.AuthenticatedTenantID &&
+		scope.ACLAPIKeyID == binding.APIKeyID &&
+		scope.ACLAccessPath == binding.AccessPath &&
+		scope.ACLAccessPathID == binding.AccessPathID
+}
+
+func (r *citationProfileRepository) refreshCitationProfileACLBinding(tx *gorm.DB, scope *types.CitationProfileScope, binding types.CitationProfileACLBinding, _ time.Time) error {
+	now, err := citationProfileDatabaseNow(tx)
+	if err != nil {
+		return err
+	}
+	nextGeneration := scope.ACLGeneration + 1
+	nextReadVersion := scope.ProfileReadVersion + 1
+	result := tx.Model(&types.CitationProfileScope{}).
+		Where("id = ? AND tenant_id = ? AND subject_id = ? AND knowledge_base_id = ? AND subject_epoch = ? AND acl_generation = ? AND deleted_at IS NULL AND fenced_at IS NULL", scope.ID, scope.TenantID, scope.SubjectID, scope.KnowledgeBaseID, scope.SubjectEpoch, scope.ACLGeneration).
+		Updates(map[string]interface{}{
+			"acl_principal_type":          binding.PrincipalType,
+			"acl_principal_id":            binding.PrincipalID,
+			"acl_authenticated_tenant_id": binding.AuthenticatedTenantID,
+			"acl_api_key_id":              binding.APIKeyID,
+			"acl_access_path":             binding.AccessPath,
+			"acl_access_path_id":          binding.AccessPathID,
+			"acl_generation":              nextGeneration,
+			"acl_check_state":             types.CitationProfileACLStateUnknown,
+			"next_acl_check_at":           now,
+			"acl_check_lease_until":       nil,
+			"acl_check_lease_token":       "",
+			"profile_read_version":        nextReadVersion,
+			"updated_at":                  now,
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return types.ErrCitationProfileChanged
+	}
+	scope.ACLPrincipalType = binding.PrincipalType
+	scope.ACLPrincipalID = binding.PrincipalID
+	scope.ACLAuthenticatedTenantID = binding.AuthenticatedTenantID
+	scope.ACLAPIKeyID = binding.APIKeyID
+	scope.ACLAccessPath = binding.AccessPath
+	scope.ACLAccessPathID = binding.AccessPathID
+	scope.ACLGeneration = nextGeneration
+	scope.ACLCheckState = types.CitationProfileACLStateUnknown
+	scope.NextACLCheckAt = citationTimePointer(now)
+	scope.ACLCheckLeaseUntil = nil
+	scope.ACLCheckLeaseToken = ""
+	scope.ProfileReadVersion = nextReadVersion
+	scope.UpdatedAt = now
+	return pauseCitationProfileOutboxRetryBudget(tx, scope, now, now)
+}
+
+func citationTimePointer(value time.Time) *time.Time {
+	value = value.UTC()
+	return &value
 }
 
 func (r *citationProfileRepository) CreateExportOperation(
@@ -223,6 +423,7 @@ func (r *citationProfileRepository) CreateExportOperation(
 	requestDigest := citationRequestDigest(types.CitationOperationExport, kbID, fmt.Sprintf("%d", expectedReadVersion), format)
 
 	var operation *types.CitationProfileOperation
+	var verifiedScope *types.CitationProfileScope
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		scope, err := r.loadLiveCitationScopeForUpdate(tx, tenantID, subjectID, kbID)
 		if err != nil {
@@ -244,14 +445,19 @@ func (r *citationProfileRepository) CreateExportOperation(
 		if scope.FencedAt != nil {
 			return types.ErrCitationProfileDeleted
 		}
-		if !citationProfileScopeACLCurrent(scope) {
-			return types.ErrCitationProfileUnavailable
+		if err := r.ensureCitationProfileACLCurrentTx(tx, scope); err != nil {
+			return err
 		}
+		scopeSnapshot := *scope
+		verifiedScope = &scopeSnapshot
 		if existing, found, err := r.findCitationProfileOperationByIdem(
 			tx, tenantID, subjectID, kbID, scope.SubjectEpoch, types.CitationOperationExport, idempotencyKey, requestDigest,
 		); err != nil {
 			return err
 		} else if found {
+			if err := r.ensureCitationProfileACLCurrentTx(tx, scope); err != nil {
+				return err
+			}
 			operation = existing
 			return nil
 		}
@@ -270,7 +476,10 @@ func (r *citationProfileRepository) CreateExportOperation(
 			return types.ErrCitationProfileQuotaExceeded
 		}
 
-		now := time.Now().UTC()
+		now, err := citationProfileDatabaseNow(tx)
+		if err != nil {
+			return err
+		}
 		events, eventsTruncated, err := r.loadCitationProfileExportEvents(tx, tenantID, subjectID, kbID, scope.SubjectEpoch)
 		if err != nil {
 			return err
@@ -288,9 +497,18 @@ func (r *citationProfileRepository) CreateExportOperation(
 			"expected_read_version": fmt.Sprintf("%d", expectedReadVersion),
 			"format":                format,
 		}, types.CitationProfileOperationStatusReady, payload, "db:result_summary", &expiresAt, now)
-		return err
+		if err != nil {
+			return err
+		}
+		return r.ensureCitationProfileACLCurrentTx(tx, scope)
 	})
-	return operation, err
+	if err != nil {
+		return nil, err
+	}
+	if err := r.verifyCitationProfileReadSnapshotFresh(ctx, verifiedScope); err != nil {
+		return nil, err
+	}
+	return operation, nil
 }
 
 func (r *citationProfileRepository) GetExportOperation(
@@ -311,6 +529,7 @@ func (r *citationProfileRepository) GetExportOperation(
 	}
 
 	var operation *types.CitationProfileOperation
+	var verifiedScope *types.CitationProfileScope
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		scope, err := r.loadLiveCitationScopeForUpdate(tx, tenantID, subjectID, kbID)
 		if err != nil {
@@ -332,9 +551,11 @@ func (r *citationProfileRepository) GetExportOperation(
 		if scope.FencedAt != nil {
 			return types.ErrCitationProfileDeleted
 		}
-		if !citationProfileScopeACLCurrent(scope) {
-			return types.ErrCitationProfileUnavailable
+		if err := r.ensureCitationProfileACLCurrentTx(tx, scope); err != nil {
+			return err
 		}
+		scopeSnapshot := *scope
+		verifiedScope = &scopeSnapshot
 		operation, err = r.loadCitationProfileOperationByID(tx, tenantID, subjectID, kbID, scope.SubjectEpoch, types.CitationOperationExport, operationID)
 		if err != nil {
 			return err
@@ -342,9 +563,40 @@ func (r *citationProfileRepository) GetExportOperation(
 		if operation.Status == types.CitationProfileOperationStatusRevoked {
 			return types.ErrCitationProfileNotFound
 		}
-		return nil
+		expiredWhere, err := citationProfileExpiredAtDatabaseSQL(
+			"citation_profile_operations",
+			tx.Dialector.Name(),
+		)
+		if err != nil {
+			return err
+		}
+		var expiredCount int64
+		if err := tx.Model(&types.CitationProfileOperation{}).
+			Where(
+				"id = ? AND tenant_id = ? AND subject_id = ? AND knowledge_base_id = ? AND subject_epoch = ? AND operation_type = ?",
+				operation.ID,
+				tenantID,
+				subjectID,
+				kbID,
+				scope.SubjectEpoch,
+				types.CitationOperationExport,
+			).
+			Where(expiredWhere).
+			Count(&expiredCount).Error; err != nil {
+			return err
+		}
+		if expiredCount == 1 {
+			operation.Status = types.CitationProfileOperationStatusExpired
+		}
+		return r.ensureCitationProfileACLCurrentTx(tx, scope)
 	})
-	return operation, err
+	if err != nil {
+		return nil, err
+	}
+	if err := r.verifyCitationProfileReadSnapshotFresh(ctx, verifiedScope); err != nil {
+		return nil, err
+	}
+	return operation, nil
 }
 
 func (r *citationProfileRepository) RequestCurrentACLDelete(
@@ -392,9 +644,12 @@ func (r *citationProfileRepository) RequestCurrentACLDelete(
 			return types.ErrCitationProfileChanged
 		}
 
-		now := time.Now().UTC()
+		now, err := citationProfileDatabaseNow(tx)
+		if err != nil {
+			return err
+		}
 		resultSummary, err := citationProfileOperationResult(scope, map[string]interface{}{
-			"receipt_code": types.CitationProfileReceiptHiddenPurgeScheduled,
+			"receipt_code": types.CitationProfileReceiptHiddenAndFenced,
 			"hidden_at":    citationTime(now),
 		}, now)
 		if err != nil {
@@ -432,12 +687,21 @@ func (r *citationProfileRepository) RequestBlindDelete(
 		if err != nil {
 			return err
 		}
-		if scope == nil || scope.FencedAt != nil {
+		if scope == nil {
+			scope, err = r.loadSharedCitationScopeForBlindDelete(tx, tenantID, subjectID, kbID)
+			if err != nil {
+				return err
+			}
+		}
+		if scope == nil {
 			operation = citationSyntheticOperation(kbID, types.CitationOperationDeleteBlind)
 			return nil
 		}
 
-		now := time.Now().UTC()
+		now, err := citationProfileDatabaseNow(tx)
+		if err != nil {
+			return err
+		}
 		operationID := uuid.NewString()
 		resultSummary, err := citationProfileOperationResult(scope, map[string]interface{}{
 			"receipt_code": types.CitationProfileReceiptAccepted,
@@ -451,16 +715,72 @@ func (r *citationProfileRepository) RequestBlindDelete(
 		if err != nil {
 			return err
 		}
+		if scope.FencedAt != nil {
+			if err := r.finalizeCitationProfileFencedScopeForBlindDelete(tx, scope, operation.ID, now); err != nil {
+				if errors.Is(err, types.ErrCitationProfileChanged) {
+					return errCitationProfileBlindDeleteRace
+				}
+				return err
+			}
+			return nil
+		}
 		if err := r.fenceCitationProfileScopeForDelete(tx, scope, operation.ID, types.CitationOperationDeleteBlind, nil, now); err != nil {
 			if errors.Is(err, types.ErrCitationProfileChanged) {
-				operation = citationSyntheticOperation(kbID, types.CitationOperationDeleteBlind)
-				return nil
+				return errCitationProfileBlindDeleteRace
 			}
 			return err
 		}
 		return nil
 	})
-	return operation, err
+	if errors.Is(err, errCitationProfileBlindDeleteRace) {
+		return citationSyntheticOperation(kbID, types.CitationOperationDeleteBlind), nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return operation, nil
+}
+
+func (r *citationProfileRepository) finalizeCitationProfileFencedScopeForBlindDelete(
+	tx *gorm.DB,
+	scope *types.CitationProfileScope,
+	operationID string,
+	now time.Time,
+) error {
+	if scope == nil || scope.FencedAt == nil || scope.DeletedAt != nil {
+		return types.ErrCitationProfileChanged
+	}
+	nextVersion := scope.ProfileReadVersion + 1
+	result := tx.Model(&types.CitationProfileScope{}).
+		Where("id = ? AND tenant_id = ? AND subject_id = ? AND knowledge_base_id = ? AND subject_epoch = ? AND deleted_at IS NULL AND fenced_at IS NOT NULL",
+			scope.ID, scope.TenantID, scope.SubjectID, scope.KnowledgeBaseID, scope.SubjectEpoch).
+		Where("profile_read_version = ?", scope.ProfileReadVersion).
+		Updates(map[string]interface{}{
+			"delete_request_id":     strings.TrimSpace(operationID),
+			"deleted_at":            now,
+			"profile_read_version":  nextVersion,
+			"pending_event_count":   0,
+			"pending_mapping_count": 0,
+			"dirty_mapping_count":   0,
+			"updated_at":            now,
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return types.ErrCitationProfileChanged
+	}
+	if err := terminateCitationProfileWorkForDelete(tx, scope, now); err != nil {
+		return err
+	}
+	if err := revokeCitationProfileExportsForScope(tx, scope, now); err != nil {
+		return err
+	}
+	scope.DeleteRequestID = strings.TrimSpace(operationID)
+	scope.DeletedAt = &now
+	scope.ProfileReadVersion = nextVersion
+	scope.UpdatedAt = now
+	return nil
 }
 
 func (r *citationProfileRepository) fenceCitationProfileScopeForDelete(
@@ -482,19 +802,24 @@ func (r *citationProfileRepository) fenceCitationProfileScopeForDelete(
 		query = query.Where("profile_read_version = ?", *expectedReadVersion)
 	}
 	result := query.Updates(map[string]interface{}{
-		"enabled":              false,
-		"fenced_at":            now,
-		"fence_reason":         fenceReason,
-		"delete_request_id":    strings.TrimSpace(operationID),
-		"deleted_at":           now,
-		"profile_read_version": nextVersion,
-		"updated_at":           now,
+		"enabled":               false,
+		"fenced_at":             now,
+		"fence_reason":          fenceReason,
+		"delete_request_id":     strings.TrimSpace(operationID),
+		"deleted_at":            now,
+		"profile_read_version":  nextVersion,
+		"pending_event_count":   0,
+		"pending_mapping_count": 0,
+		"updated_at":            now,
 	})
 	if result.Error != nil {
 		return result.Error
 	}
 	if result.RowsAffected == 0 {
 		return types.ErrCitationProfileChanged
+	}
+	if err := terminateCitationProfileWorkForDelete(tx, scope, now); err != nil {
+		return err
 	}
 	if err := revokeCitationProfileExportsForScope(tx, scope, now); err != nil {
 		return err
@@ -516,7 +841,7 @@ func revokeCitationProfileExportsForScope(tx *gorm.DB, scope *types.CitationProf
 	revokedSummary, err := citationJSON(map[string]interface{}{
 		"contract_version": types.CitationProfileContractVersion,
 		"revoked_at":       citationTime(now),
-		"receipt_code":     types.CitationProfileReceiptHiddenPurgeScheduled,
+		"receipt_code":     types.CitationProfileReceiptHiddenAndFenced,
 	})
 	if err != nil {
 		return err
@@ -535,13 +860,187 @@ func revokeCitationProfileExportsForScope(tx *gorm.DB, scope *types.CitationProf
 		}).Error
 }
 
-func citationProfileScopeACLCurrent(scope *types.CitationProfileScope) bool {
-	if scope == nil {
-		return false
-	}
-	state := strings.TrimSpace(scope.ACLCheckState)
-	return state == "" || state == types.CitationProfileACLStateCurrent
+func citationProfileScopeACLCurrent(scope *types.CitationProfileScope, now time.Time) bool {
+	return scope != nil && scope.ACLCurrentAt(now)
 }
+
+// citationProfileACLCurrentSQL mirrors CitationProfileScope.ACLCurrentAt for
+// compare-and-swap paths that must fence expiry without first materializing a
+// scope. alias is always an internal, static table name or alias.
+func citationProfileACLCurrentSQL(alias string, now time.Time) (string, []interface{}) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	return citationProfileACLCurrentSQLAt(
+		alias,
+		alias+".acl_checked_at",
+		alias+".next_acl_check_at",
+		"?",
+		[]interface{}{now},
+	)
+}
+
+// citationProfileACLCurrentDatabaseSQL is the production authorization gate.
+// PostgreSQL statement_timestamp() is fixed for one statement but, unlike
+// CURRENT_TIMESTAMP, advances inside a long transaction. SQLite guarantees
+// that every 'now' use in one sqlite3_step observes the same instant. Neither
+// path trusts an application-node wall clock.
+func citationProfileACLCurrentDatabaseSQL(alias string, dialect string) (string, []interface{}, error) {
+	switch strings.ToLower(strings.TrimSpace(dialect)) {
+	case "postgres":
+		predicate, args := citationProfileACLCurrentSQLAt(
+			alias,
+			alias+".acl_checked_at",
+			alias+".next_acl_check_at",
+			"statement_timestamp()",
+			nil,
+		)
+		return predicate, args, nil
+	case "sqlite":
+		predicate, args := citationProfileACLCurrentSQLAt(
+			alias,
+			"julianday("+alias+".acl_checked_at)",
+			"julianday("+alias+".next_acl_check_at)",
+			"julianday('now')",
+			nil,
+		)
+		return predicate, args, nil
+	default:
+		return "", nil, fmt.Errorf("citation profile ACL clock: unsupported database dialect %q", dialect)
+	}
+}
+
+func citationProfileExpiredAtDatabaseSQL(alias string, dialect string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(dialect)) {
+	case "postgres":
+		return alias + ".expires_at IS NOT NULL AND " + alias + ".expires_at <= statement_timestamp()", nil
+	case "sqlite":
+		return alias + ".expires_at IS NOT NULL AND julianday(" + alias + ".expires_at) <= julianday('now')", nil
+	default:
+		return "", fmt.Errorf("citation profile expiry clock: unsupported database dialect %q", dialect)
+	}
+}
+
+func citationProfileACLCurrentSQLAt(
+	alias string,
+	checkedAtExpression string,
+	nextCheckAtExpression string,
+	clockExpression string,
+	clockArgs []interface{},
+) (string, []interface{}) {
+	predicate := fmt.Sprintf(`
+		%[1]s.acl_check_state = ?
+		AND %[1]s.acl_checked_at IS NOT NULL
+		AND %[2]s <= %[4]s
+		AND %[1]s.next_acl_check_at IS NOT NULL
+		AND %[3]s > %[4]s
+		AND %[3]s > %[2]s
+		AND %[1]s.acl_generation > 0
+		AND %[1]s.acl_check_lease_token = ''
+		AND %[1]s.acl_check_lease_until IS NULL
+		AND %[1]s.tenant_id > 0
+		AND TRIM(%[1]s.knowledge_base_id) <> ''
+		AND TRIM(%[1]s.acl_principal_id) <> ''
+		AND %[1]s.acl_authenticated_tenant_id > 0
+		AND (
+			(%[1]s.acl_principal_type = ? AND %[1]s.acl_api_key_id = 0)
+			OR (%[1]s.acl_principal_type IN (?, ?) AND %[1]s.acl_api_key_id > 0)
+		)
+		AND (
+			(%[1]s.acl_access_path = ? AND TRIM(%[1]s.acl_access_path_id) = '' AND %[1]s.acl_authenticated_tenant_id = %[1]s.tenant_id)
+			OR (%[1]s.acl_access_path = ? AND TRIM(%[1]s.acl_access_path_id) = TRIM(%[1]s.knowledge_base_id))
+			OR (%[1]s.acl_access_path = ? AND TRIM(%[1]s.acl_access_path_id) <> '')
+		)`, alias, checkedAtExpression, nextCheckAtExpression, clockExpression)
+	args := []interface{}{types.CitationProfileACLStateCurrent}
+	args = append(args, clockArgs...)
+	args = append(args, clockArgs...)
+	args = append(args,
+		types.PrincipalWebUser,
+		types.PrincipalAPITenant,
+		types.PrincipalAPIExternalUser,
+		types.CitationProfileACLAccessPathOwner,
+		types.CitationProfileACLAccessPathKBShare,
+		types.CitationProfileACLAccessPathAgentShare,
+	)
+	return predicate, args
+}
+
+func (r *citationProfileRepository) ensureCitationProfileACLCurrentTx(
+	tx *gorm.DB,
+	scope *types.CitationProfileScope,
+) error {
+	if tx == nil || scope == nil {
+		return types.ErrCitationProfileUnavailable
+	}
+	currentACLWhere, currentACLArgs, err := citationProfileACLCurrentDatabaseSQL(
+		"citation_profile_scopes",
+		tx.Dialector.Name(),
+	)
+	if err != nil {
+		return err
+	}
+	var count int64
+	err = tx.Model(&types.CitationProfileScope{}).
+		Where(
+			"id = ? AND tenant_id = ? AND subject_id = ? AND knowledge_base_id = ? AND subject_epoch = ? AND enabled = ? AND deleted_at IS NULL AND fenced_at IS NULL",
+			scope.ID,
+			scope.TenantID,
+			scope.SubjectID,
+			scope.KnowledgeBaseID,
+			scope.SubjectEpoch,
+			true,
+		).
+		Where(currentACLWhere, currentACLArgs...).
+		Count(&count).Error
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return types.ErrCitationProfileUnavailable
+	}
+	return nil
+}
+
+// citationAdmissionRejection is an expected, redacted admission outcome. It
+// must not abort the message transaction: the assistant message is still a
+// valid product record, while the particular reference is not admitted as
+// Fact A. The code deliberately contains no tenant, subject, knowledge, or KB
+// identifiers so it is safe to log at an outer boundary.
+type citationAdmissionRejection struct {
+	code string
+}
+
+func (e *citationAdmissionRejection) Error() string {
+	if e == nil || e.code == "" {
+		return "citation profile admission rejected"
+	}
+	return "citation profile admission rejected: " + e.code
+}
+
+func isCitationAdmissionRejection(err error) bool {
+	var rejection *citationAdmissionRejection
+	return errors.As(err, &rejection)
+}
+
+func (r *citationProfileRepository) lockCitationSession(
+	tx *gorm.DB,
+	tenantID uint64,
+	subjectID string,
+	sessionID string,
+) error {
+	var session types.Session
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Select("id").
+		Where("id = ? AND tenant_id = ? AND user_id = ? AND deleted_at IS NULL", sessionID, tenantID, subjectID).
+		First(&session).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return gorm.ErrRecordNotFound
+	}
+	return err
+}
+
 func (r *citationProfileRepository) CompleteAssistantMessageWithEvents(
 	ctx context.Context,
 	tenantID uint64,
@@ -565,8 +1064,11 @@ func (r *citationProfileRepository) CompleteAssistantMessageWithEvents(
 	var eventCount int
 	var eventIDs []string
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := r.lockCitationSession(tx, tenantID, subjectID, message.SessionID); err != nil {
+			return err
+		}
 		result := tx.Model(&types.Message{}).
-			Where("id = ? AND session_id = ?", message.ID, message.SessionID).
+			Where("id = ? AND session_id = ? AND deleted_at IS NULL", message.ID, message.SessionID).
 			Updates(message)
 		if result.Error != nil {
 			return result.Error
@@ -582,6 +1084,10 @@ func (r *citationProfileRepository) CompleteAssistantMessageWithEvents(
 		if len(events) == 0 {
 			return nil
 		}
+		scopeUpdatedAt, err := citationProfileDatabaseNow(tx)
+		if err != nil {
+			return err
+		}
 		eventIDs = make([]string, 0, len(events))
 		for _, event := range events {
 			eventIDs = append(eventIDs, event.ID)
@@ -592,22 +1098,73 @@ func (r *citationProfileRepository) CompleteAssistantMessageWithEvents(
 		if err := tx.Create(&outboxRows).Error; err != nil {
 			return err
 		}
-		for scopeID, delta := range scopeDeltas {
-			if delta <= 0 {
+		orderedScopeIDs := make([]string, 0, len(scopeDeltas))
+		for scopeID := range scopeDeltas {
+			orderedScopeIDs = append(orderedScopeIDs, scopeID)
+		}
+		sort.Strings(orderedScopeIDs)
+		for _, scopeID := range orderedScopeIDs {
+			delta := scopeDeltas[scopeID]
+			if delta.Count <= 0 {
 				continue
 			}
+			currentACLWhere, currentACLArgs, err := citationProfileACLCurrentDatabaseSQL(
+				"citation_profile_scopes",
+				tx.Dialector.Name(),
+			)
+			if err != nil {
+				return err
+			}
 			result := tx.Model(&types.CitationProfileScope{}).
-				Where("id = ? AND tenant_id = ? AND subject_id = ? AND deleted_at IS NULL AND fenced_at IS NULL", scopeID, tenantID, subjectID).
+				Where(
+					"id = ? AND tenant_id = ? AND subject_id = ? AND knowledge_base_id = ? AND subject_epoch = ? AND enabled = ? AND deleted_at IS NULL AND fenced_at IS NULL",
+					scopeID,
+					tenantID,
+					subjectID,
+					delta.KnowledgeBaseID,
+					delta.SubjectEpoch,
+					true,
+				).
+				Where(currentACLWhere, currentACLArgs...).
 				Updates(map[string]interface{}{
-					"profile_read_version": gorm.Expr("profile_read_version + ?", delta),
-					"pending_event_count":  gorm.Expr("pending_event_count + ?", delta),
-					"updated_at":           message.UpdatedAt,
+					"profile_read_version": gorm.Expr("profile_read_version + ?", delta.Count),
+					"pending_event_count":  gorm.Expr("pending_event_count + ?", delta.Count),
+					"updated_at":           scopeUpdatedAt,
 				})
 			if result.Error != nil {
 				return result.Error
 			}
 			if result.RowsAffected == 0 {
-				return fmt.Errorf("citation profile scope changed before event commit: %s", scopeID)
+				return fmt.Errorf("%w: scope identity changed before event commit", types.ErrCitationProfileChanged)
+			}
+		}
+		if len(orderedScopeIDs) > 0 {
+			// Re-check every participating scope together at the final
+			// rollback-capable point. A per-scope CAS is insufficient: an
+			// earlier scope can naturally cross its ACL deadline while later
+			// scopes are still being updated.
+			currentACLWhere, currentACLArgs, err := citationProfileACLCurrentDatabaseSQL(
+				"citation_profile_scopes",
+				tx.Dialector.Name(),
+			)
+			if err != nil {
+				return err
+			}
+			var currentScopeCount int64
+			if err := tx.Model(&types.CitationProfileScope{}).
+				Where(
+					"id IN ? AND tenant_id = ? AND subject_id = ? AND enabled = ? AND deleted_at IS NULL AND fenced_at IS NULL",
+					orderedScopeIDs,
+					tenantID,
+					subjectID,
+					true,
+				).
+				Where(currentACLWhere, currentACLArgs...).
+				Count(&currentScopeCount).Error; err != nil {
+				return err
+			}
+			if currentScopeCount != int64(len(orderedScopeIDs)) {
+				return types.ErrCitationProfileUnavailable
 			}
 		}
 		eventCount = len(events)
@@ -616,12 +1173,69 @@ func (r *citationProfileRepository) CompleteAssistantMessageWithEvents(
 	if err != nil {
 		return eventCount, err
 	}
+	pendingEventIDs, err := r.pendingCitationEventIDsForMessage(ctx, tenantID, subjectID, message.ID)
+	if err != nil {
+		return eventCount, &types.CitationProfilePostCommitError{Cause: err}
+	}
+	eventIDs = append(eventIDs, pendingEventIDs...)
+	eventIDs = uniqueCitationEventIDs(eventIDs)
+	var resolveErrs []error
 	for _, eventID := range eventIDs {
 		if _, resolveErr := r.ResolveEvidenceEvent(ctx, tenantID, subjectID, eventID); resolveErr != nil {
-			return eventCount, resolveErr
+			resolveErrs = append(resolveErrs, resolveErr)
 		}
 	}
+	resolveErr := errors.Join(resolveErrs...)
+	if resolveErr != nil {
+		return eventCount, &types.CitationProfilePostCommitError{Cause: resolveErr}
+	}
 	return eventCount, nil
+}
+
+// pendingCitationEventIDsForMessage discovers already-committed work without
+// reconstructing event-time evidence from mutable Knowledge rows. The scope
+// predicates make a current delete/fence win over a late completion retry.
+func (r *citationProfileRepository) pendingCitationEventIDsForMessage(
+	ctx context.Context,
+	tenantID uint64,
+	subjectID string,
+	messageID string,
+) ([]string, error) {
+	var eventIDs []string
+	err := r.db.WithContext(ctx).
+		Table("citation_profile_events AS e").
+		Select("e.id").
+		Joins("JOIN citation_profile_scopes AS s ON s.id = e.scope_id AND s.tenant_id = e.tenant_id AND s.subject_id = e.subject_id AND s.knowledge_base_id = e.knowledge_base_id AND s.subject_epoch = e.subject_epoch").
+		Joins("LEFT JOIN citation_profile_event_outbox AS o ON o.event_id = e.id AND o.tenant_id = e.tenant_id AND o.subject_id = e.subject_id AND o.knowledge_base_id = e.knowledge_base_id AND o.subject_epoch = e.subject_epoch AND o.scope_id = e.scope_id").
+		Where("e.tenant_id = ? AND e.subject_id = ? AND e.message_id = ? AND e.retracted_at IS NULL", tenantID, subjectID, messageID).
+		Where("s.enabled = ? AND s.deleted_at IS NULL AND s.fenced_at IS NULL", true).
+		Where("(e.status = ? AND (o.id IS NULL OR o.status NOT IN (?, ?)) OR (COALESCE(e.active_run_id, '') <> '' AND (o.id IS NULL OR o.status NOT IN (?, ?))))",
+			types.CitationProfileEventStatusPendingResolution,
+			types.CitationProfileOutboxStatusDelivered,
+			types.CitationProfileOutboxStatusDeadletter,
+			types.CitationProfileOutboxStatusDelivered,
+			types.CitationProfileOutboxStatusDeadletter,
+		).
+		Group("e.id, e.created_at").
+		Order("e.created_at ASC, e.id ASC").
+		Pluck("e.id", &eventIDs).Error
+	return eventIDs, err
+}
+
+func uniqueCitationEventIDs(eventIDs []string) []string {
+	if len(eventIDs) < 2 {
+		return eventIDs
+	}
+	seen := make(map[string]struct{}, len(eventIDs))
+	unique := make([]string, 0, len(eventIDs))
+	for _, eventID := range eventIDs {
+		if _, exists := seen[eventID]; exists {
+			continue
+		}
+		seen[eventID] = struct{}{}
+		unique = append(unique, eventID)
+	}
+	return unique
 }
 
 func (r *citationProfileRepository) ResolveEvidenceEvent(
@@ -629,6 +1243,16 @@ func (r *citationProfileRepository) ResolveEvidenceEvent(
 	tenantID uint64,
 	subjectID string,
 	eventID string,
+) (*types.EvidenceResolutionRun, error) {
+	return r.resolveEvidenceEvent(ctx, tenantID, subjectID, eventID, nil)
+}
+
+func (r *citationProfileRepository) resolveEvidenceEvent(
+	ctx context.Context,
+	tenantID uint64,
+	subjectID string,
+	eventID string,
+	claimedOutbox *types.CitationProfileEventOutbox,
 ) (*types.EvidenceResolutionRun, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("citation profile repository requires database")
@@ -641,7 +1265,34 @@ func (r *citationProfileRepository) ResolveEvidenceEvent(
 
 	var resolvedRun *types.EvidenceResolutionRun
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		eventSeed, err := r.loadCitationEvent(tx, tenantID, subjectID, eventID)
+		if err != nil {
+			return err
+		}
+		if err := lockCitationProfileSourceUniverseShared(tx, tenantID, eventSeed.KnowledgeBaseID); err != nil {
+			return err
+		}
+		// Every mutating path takes the scope lock before the event lock.
+		// Read the identity first, lock the authoritative scope, then reload
+		// the event under lock so delete/correction/resolution serialize in one
+		// order without allowing a stale identity to publish a run.
+		scope, err := r.loadActiveCitationScopeByID(tx, tenantID, subjectID, eventSeed.KnowledgeBaseID, eventSeed.SubjectEpoch, eventSeed.ScopeID)
+		if err != nil {
+			return err
+		}
 		event, err := r.loadCitationEventForUpdate(tx, tenantID, subjectID, eventID)
+		if err != nil {
+			return err
+		}
+		if event.KnowledgeBaseID != eventSeed.KnowledgeBaseID ||
+			event.SubjectEpoch != eventSeed.SubjectEpoch ||
+			event.ScopeID != eventSeed.ScopeID {
+			return types.ErrCitationProfileChanged
+		}
+		if event.RetractedAt != nil {
+			return types.ErrCitationProfileDeleted
+		}
+		resolutionClaim, outboxAlreadyDelivered, err := lockCitationProfileOutboxForResolution(tx, event, claimedOutbox)
 		if err != nil {
 			return err
 		}
@@ -650,26 +1301,43 @@ func (r *citationProfileRepository) ResolveEvidenceEvent(
 			if err != nil {
 				return err
 			}
-			if err := markCitationEventOutboxDelivered(tx, event, time.Now().UTC()); err != nil {
+			if !citationProfileResolutionRunIsTerminalForEvent(run, event) {
+				return types.ErrCitationProfileUnavailable
+			}
+			if !outboxAlreadyDelivered {
+				deliveredAt, err := citationProfileDatabaseNow(tx)
+				if err != nil {
+					return err
+				}
+				if err := markCitationEventOutboxDelivered(tx, event, resolutionClaim, deliveredAt); err != nil {
+					return err
+				}
+			}
+			if err := r.ensureCitationProfileACLCurrentTx(tx, scope); err != nil {
 				return err
 			}
 			resolvedRun = run
 			return nil
 		}
 		if event.Status != types.CitationProfileEventStatusPendingResolution {
-			return fmt.Errorf("citation profile event is not pending: %s", event.Status)
+			return fmt.Errorf("%w: event is not pending", types.ErrCitationProfileChanged)
 		}
-
-		scope, err := r.loadActiveCitationScopeByID(tx, tenantID, subjectID, event.KnowledgeBaseID, event.SubjectEpoch, event.ScopeID)
-		if err != nil {
-			return err
+		if outboxAlreadyDelivered {
+			return types.ErrCitationProfileOutboxLeaseLost
 		}
 		rows, err := r.loadCurrentWikiSourceRefRows(tx, tenantID, event.KnowledgeBaseID, event.SourceKnowledgeID)
 		if err != nil {
 			return err
 		}
+		linkStates, err := r.loadCitationResolutionLinkStates(tx, event, rows)
+		if err != nil {
+			return err
+		}
 
-		now := time.Now().UTC()
+		now, err := citationProfileDatabaseNow(tx)
+		if err != nil {
+			return err
+		}
 		mappingRevision, watermark := citationResolutionSnapshot(scope, rows, event.SourceKnowledgeID)
 		runStatus := types.CitationProfileEventStatusResolved
 		if len(rows) == 0 {
@@ -705,7 +1373,7 @@ func (r *citationProfileRepository) ResolveEvidenceEvent(
 			run.ErrorMessage = fmt.Sprintf("resolved %d links, limit is %d", len(rows), limits.LinksPerEvent)
 			run.FailedAt = &now
 		} else {
-			links = buildEvidenceNodeLinks(event, run, rows, now)
+			links = buildEvidenceNodeLinks(event, run, rows, linkStates, now)
 			run.OutputCount = len(links)
 			run.OutputHash = citationEvidenceOutputHash(links)
 			run.ResolvedAt = &now
@@ -720,9 +1388,10 @@ func (r *citationProfileRepository) ResolveEvidenceEvent(
 		}
 
 		eventUpdates := map[string]interface{}{
-			"active_run_id": run.ID,
-			"status":        runStatus,
-			"updated_at":    now,
+			"active_run_id":  run.ID,
+			"status":         runStatus,
+			"pending_reason": "",
+			"updated_at":     now,
 		}
 		if tooManyLinks {
 			eventUpdates["failed_reason"] = run.ErrorMessage
@@ -730,7 +1399,15 @@ func (r *citationProfileRepository) ResolveEvidenceEvent(
 			eventUpdates["resolved_at"] = now
 		}
 		result := tx.Model(&types.CitationProfileEvent{}).
-			Where("id = ? AND tenant_id = ? AND subject_id = ? AND COALESCE(active_run_id, '') = ''", event.ID, tenantID, subjectID).
+			Where(
+				"id = ? AND tenant_id = ? AND subject_id = ? AND knowledge_base_id = ? AND subject_epoch = ? AND scope_id = ? AND retracted_at IS NULL AND COALESCE(active_run_id, '') = ''",
+				event.ID,
+				tenantID,
+				subjectID,
+				event.KnowledgeBaseID,
+				event.SubjectEpoch,
+				event.ScopeID,
+			).
 			Updates(eventUpdates)
 		if result.Error != nil {
 			return result.Error
@@ -747,9 +1424,19 @@ func (r *citationProfileRepository) ResolveEvidenceEvent(
 			"source_universe_watermark": watermark,
 			"updated_at":                now,
 		}
+		if event.PendingReason == "wiki_source_ref_drift" {
+			scopeUpdates["dirty_mapping_count"] = gorm.Expr("CASE WHEN dirty_mapping_count > 0 THEN dirty_mapping_count - 1 ELSE 0 END")
+		}
 		result = tx.Model(&types.CitationProfileScope{}).
-			Where("id = ? AND tenant_id = ? AND subject_id = ? AND subject_epoch = ? AND deleted_at IS NULL AND fenced_at IS NULL",
-				scope.ID, tenantID, subjectID, event.SubjectEpoch).
+			Where(
+				"id = ? AND tenant_id = ? AND subject_id = ? AND knowledge_base_id = ? AND subject_epoch = ? AND enabled = ? AND deleted_at IS NULL AND fenced_at IS NULL",
+				scope.ID,
+				tenantID,
+				subjectID,
+				event.KnowledgeBaseID,
+				event.SubjectEpoch,
+				true,
+			).
 			Updates(scopeUpdates)
 		if result.Error != nil {
 			return result.Error
@@ -757,7 +1444,10 @@ func (r *citationProfileRepository) ResolveEvidenceEvent(
 		if result.RowsAffected == 0 {
 			return fmt.Errorf("citation profile scope changed before run publish: %s", scope.ID)
 		}
-		if err := markCitationEventOutboxDelivered(tx, event, now); err != nil {
+		if err := markCitationEventOutboxDelivered(tx, event, resolutionClaim, now); err != nil {
+			return err
+		}
+		if err := r.ensureCitationProfileACLCurrentTx(tx, scope); err != nil {
 			return err
 		}
 
@@ -766,12 +1456,55 @@ func (r *citationProfileRepository) ResolveEvidenceEvent(
 	})
 	return resolvedRun, err
 }
+
+func (r *citationProfileRepository) ResolveClaimedEvidenceEvent(
+	ctx context.Context,
+	claim *types.CitationProfileEventOutbox,
+) (*types.EvidenceResolutionRun, error) {
+	if !validCitationProfileOutboxClaim(claim) {
+		return nil, types.ErrCitationProfileOutboxLeaseLost
+	}
+	return r.resolveEvidenceEvent(ctx, claim.TenantID, claim.SubjectID, claim.EventID, claim)
+}
+
+func citationProfileResolutionRunIsTerminalForEvent(
+	run *types.EvidenceResolutionRun,
+	event *types.CitationProfileEvent,
+) bool {
+	if run == nil || event == nil ||
+		run.EventID != event.ID ||
+		run.KnowledgeBaseID != event.KnowledgeBaseID ||
+		run.SubjectEpoch != event.SubjectEpoch ||
+		run.ScopeID != event.ScopeID ||
+		run.Status != event.Status {
+		return false
+	}
+	switch run.Status {
+	case types.CitationProfileEventStatusResolved, types.CitationProfileEventStatusResolvedEmpty:
+		return run.ResolvedAt != nil && run.FailedAt == nil
+	case types.CitationProfileEventStatusFailed:
+		return run.FailedAt != nil && run.ResolvedAt == nil
+	default:
+		return false
+	}
+}
+
+type citationProfileScopeDelta struct {
+	KnowledgeBaseID string
+	SubjectEpoch    string
+	Count           int
+}
+
 func (r *citationProfileRepository) buildCompletedAnswerEvents(
 	tx *gorm.DB,
 	tenantID uint64,
 	subjectID string,
 	message *types.Message,
-) ([]types.CitationProfileEvent, []types.CitationProfileEventOutbox, map[string]int, error) {
+) ([]types.CitationProfileEvent, []types.CitationProfileEventOutbox, map[string]citationProfileScopeDelta, error) {
+	enqueuedAt, err := citationProfileDatabaseNow(tx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	now := message.UpdatedAt.UTC()
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -781,8 +1514,16 @@ func (r *citationProfileRepository) buildCompletedAnswerEvents(
 
 	events := make([]types.CitationProfileEvent, 0, len(message.KnowledgeReferences))
 	outboxRows := make([]types.CitationProfileEventOutbox, 0, len(message.KnowledgeReferences))
-	scopeDeltas := make(map[string]int)
-	scopesByKB := make(map[string]*types.CitationProfileScope)
+	scopeDeltas := make(map[string]citationProfileScopeDelta)
+	type candidate struct {
+		originReferenceIndex int
+		reference            *types.SearchResult
+		knowledge            *types.Knowledge
+		knowledgeBaseID      string
+	}
+	candidates := make([]candidate, 0, len(message.KnowledgeReferences))
+	knowledgeBaseIDs := make([]string, 0, len(message.KnowledgeReferences))
+	seenKnowledgeBases := make(map[string]struct{}, len(message.KnowledgeReferences))
 
 	for i, ref := range message.KnowledgeReferences {
 		if ref == nil {
@@ -794,21 +1535,40 @@ func (r *citationProfileRepository) buildCompletedAnswerEvents(
 		}
 		knowledge, err := r.loadCitationKnowledge(tx, tenantID, knowledgeID)
 		if err != nil {
+			if isCitationAdmissionRejection(err) {
+				continue
+			}
 			return nil, nil, nil, err
 		}
 		kbID := strings.TrimSpace(knowledge.KnowledgeBaseID)
 		if kbID == "" {
-			return nil, nil, nil, fmt.Errorf("citation profile knowledge has no knowledge base: %s", knowledgeID)
+			continue
 		}
-		scope, ok := scopesByKB[kbID]
-		if !ok {
-			loaded, err := r.loadActiveCitationScope(tx, tenantID, subjectID, kbID)
-			if err != nil {
-				return nil, nil, nil, err
-			}
-			scope = loaded
-			scopesByKB[kbID] = scope
+		if referencedKB := strings.TrimSpace(ref.KnowledgeBaseID); referencedKB != "" && referencedKB != kbID {
+			continue
 		}
+		candidates = append(candidates, candidate{
+			originReferenceIndex: i,
+			reference:            ref,
+			knowledge:            knowledge,
+			knowledgeBaseID:      kbID,
+		})
+		if _, ok := seenKnowledgeBases[kbID]; !ok {
+			seenKnowledgeBases[kbID] = struct{}{}
+			knowledgeBaseIDs = append(knowledgeBaseIDs, kbID)
+		}
+	}
+
+	scopesByKB, err := r.loadActiveCitationScopes(tx, tenantID, subjectID, knowledgeBaseIDs)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	for _, candidate := range candidates {
+		i := candidate.originReferenceIndex
+		ref := candidate.reference
+		knowledge := candidate.knowledge
+		kbID := candidate.knowledgeBaseID
+		scope := scopesByKB[kbID]
 		if scope == nil {
 			continue
 		}
@@ -841,6 +1601,9 @@ func (r *citationProfileRepository) buildCompletedAnswerEvents(
 		}
 		knowledgeBaseProof, err := r.citationKnowledgeBaseProof(tx, tenantID, knowledge, now)
 		if err != nil {
+			if isCitationAdmissionRejection(err) {
+				continue
+			}
 			return nil, nil, nil, err
 		}
 
@@ -886,11 +1649,15 @@ func (r *citationProfileRepository) buildCompletedAnswerEvents(
 			ScopeID:         scope.ID,
 			EventID:         eventID,
 			Status:          types.CitationProfileOutboxStatusPending,
-			NextAttemptAt:   now,
-			CreatedAt:       now,
-			UpdatedAt:       now,
+			NextAttemptAt:   enqueuedAt,
+			CreatedAt:       enqueuedAt,
+			UpdatedAt:       enqueuedAt,
 		})
-		scopeDeltas[scope.ID]++
+		delta := scopeDeltas[scope.ID]
+		delta.KnowledgeBaseID = kbID
+		delta.SubjectEpoch = scope.SubjectEpoch
+		delta.Count++
+		scopeDeltas[scope.ID] = delta
 	}
 
 	return events, outboxRows, scopeDeltas, nil
@@ -901,39 +1668,51 @@ func (r *citationProfileRepository) loadCitationKnowledge(tx *gorm.DB, tenantID 
 	err := tx.Where("tenant_id = ? AND id = ?", tenantID, knowledgeID).First(&knowledge).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, fmt.Errorf("citation profile knowledge proof not found: %s", knowledgeID)
+			return nil, &citationAdmissionRejection{code: "knowledge_not_found"}
 		}
 		return nil, err
 	}
 	return &knowledge, nil
 }
 
-func (r *citationProfileRepository) loadActiveCitationScope(
+func (r *citationProfileRepository) loadActiveCitationScopes(
 	tx *gorm.DB,
 	tenantID uint64,
 	subjectID string,
-	kbID string,
-) (*types.CitationProfileScope, error) {
-	var scope types.CitationProfileScope
-	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-		Where(
-			"tenant_id = ? AND subject_id = ? AND knowledge_base_id = ? AND enabled = ? AND deleted_at IS NULL AND fenced_at IS NULL",
-			tenantID,
-			subjectID,
-			kbID,
-			true,
-		).
-		First(&scope).Error
+	knowledgeBaseIDs []string,
+) (map[string]*types.CitationProfileScope, error) {
+	result := make(map[string]*types.CitationProfileScope, len(knowledgeBaseIDs))
+	if len(knowledgeBaseIDs) == 0 {
+		return result, nil
+	}
+	knowledgeBaseIDs = append([]string(nil), knowledgeBaseIDs...)
+	sort.Strings(knowledgeBaseIDs)
+	currentACLWhere, currentACLArgs, err := citationProfileACLCurrentDatabaseSQL(
+		"citation_profile_scopes",
+		tx.Dialector.Name(),
+	)
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, nil
-		}
 		return nil, err
 	}
-	if !citationProfileScopeACLCurrent(&scope) {
-		return nil, nil
+	var scopes []types.CitationProfileScope
+	err = tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where(
+			"tenant_id = ? AND subject_id = ? AND knowledge_base_id IN ? AND enabled = ? AND deleted_at IS NULL AND fenced_at IS NULL",
+			tenantID,
+			subjectID,
+			knowledgeBaseIDs,
+			true,
+		).
+		Where(currentACLWhere, currentACLArgs...).
+		Order("id ASC").
+		Find(&scopes).Error
+	if err != nil {
+		return nil, err
 	}
-	return &scope, nil
+	for i := range scopes {
+		result[scopes[i].KnowledgeBaseID] = &scopes[i]
+	}
+	return result, nil
 }
 
 func (r *citationProfileRepository) citationEventExists(
@@ -947,7 +1726,7 @@ func (r *citationProfileRepository) citationEventExists(
 	var existing types.CitationProfileEvent
 	err := tx.Select("id").
 		Where(
-			"tenant_id = ? AND subject_id = ? AND knowledge_base_id = ? AND subject_epoch = ? AND producer_event_key = ? AND retracted_at IS NULL",
+			"tenant_id = ? AND subject_id = ? AND knowledge_base_id = ? AND subject_epoch = ? AND producer_event_key = ?",
 			tenantID,
 			subjectID,
 			kbID,
@@ -981,7 +1760,7 @@ func (r *citationProfileRepository) citationKnowledgeBaseProof(
 		First(&kb).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, fmt.Errorf("citation profile knowledge base proof not found: %s", knowledge.KnowledgeBaseID)
+			return nil, &citationAdmissionRejection{code: "knowledge_base_not_found"}
 		}
 		return nil, err
 	}
@@ -1100,11 +1879,29 @@ func (r *citationProfileRepository) loadCitationEventForUpdate(
 ) (*types.CitationProfileEvent, error) {
 	var event types.CitationProfileEvent
 	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-		Where("id = ? AND tenant_id = ? AND subject_id = ? AND retracted_at IS NULL", eventID, tenantID, subjectID).
+		Where("id = ? AND tenant_id = ? AND subject_id = ?", eventID, tenantID, subjectID).
 		First(&event).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, fmt.Errorf("citation profile event not found: %s", eventID)
+			return nil, types.ErrCitationProfileNotFound
+		}
+		return nil, err
+	}
+	return &event, nil
+}
+
+func (r *citationProfileRepository) loadCitationEvent(
+	tx *gorm.DB,
+	tenantID uint64,
+	subjectID string,
+	eventID string,
+) (*types.CitationProfileEvent, error) {
+	var event types.CitationProfileEvent
+	err := tx.Where("id = ? AND tenant_id = ? AND subject_id = ?", eventID, tenantID, subjectID).
+		First(&event).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, types.ErrCitationProfileNotFound
 		}
 		return nil, err
 	}
@@ -1121,7 +1918,7 @@ func (r *citationProfileRepository) loadEvidenceResolutionRun(
 	err := tx.Where("id = ? AND tenant_id = ? AND subject_id = ?", runID, tenantID, subjectID).First(&run).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, fmt.Errorf("citation profile evidence run not found: %s", runID)
+			return nil, types.ErrCitationProfileNotFound
 		}
 		return nil, err
 	}
@@ -1150,12 +1947,12 @@ func (r *citationProfileRepository) loadActiveCitationScopeByID(
 		First(&scope).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, fmt.Errorf("citation profile active scope not found: %s", scopeID)
+			return nil, types.ErrCitationProfileDeleted
 		}
 		return nil, err
 	}
-	if !citationProfileScopeACLCurrent(&scope) {
-		return nil, types.ErrCitationProfileUnavailable
+	if err := r.ensureCitationProfileACLCurrentTx(tx, &scope); err != nil {
+		return nil, err
 	}
 	return &scope, nil
 }
@@ -1183,10 +1980,15 @@ func buildEvidenceNodeLinks(
 	event *types.CitationProfileEvent,
 	run *types.EvidenceResolutionRun,
 	rows []types.WikiSourceRefIndex,
+	linkStates map[string]string,
 	createdAt time.Time,
 ) []types.EvidenceNodeLink {
 	links := make([]types.EvidenceNodeLink, 0, len(rows))
 	for _, row := range rows {
+		relationState := types.EvidenceRelationCurrent
+		if state := strings.TrimSpace(linkStates[row.PageUUID]); state != "" {
+			relationState = state
+		}
 		links = append(links, types.EvidenceNodeLink{
 			ID:                uuid.NewString(),
 			TenantID:          event.TenantID,
@@ -1200,14 +2002,63 @@ func buildEvidenceNodeLinks(
 			PageUUID:          row.PageUUID,
 			PageVersion:       row.PageVersion,
 			NormalizedRef:     row.NormalizedRef,
-			RelationState:     types.EvidenceRelationCurrent,
+			RelationState:     relationState,
 			RelationSource:    "source_ref_index",
-			MappingRevision:   row.MappingRevision,
+			MappingRevision:   run.RunMappingRevision,
 			UniverseWatermark: run.RunUniverseWatermark,
 			CreatedAt:         createdAt,
 		})
 	}
 	return links
+}
+
+func (r *citationProfileRepository) loadCitationResolutionLinkStates(
+	tx *gorm.DB,
+	event *types.CitationProfileEvent,
+	rows []types.WikiSourceRefIndex,
+) (map[string]string, error) {
+	states := make(map[string]string)
+	if event == nil || len(rows) == 0 {
+		return states, nil
+	}
+	pageUUIDs := make([]string, 0, len(rows))
+	seen := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		pageUUID := strings.TrimSpace(row.PageUUID)
+		if pageUUID == "" {
+			continue
+		}
+		if _, ok := seen[pageUUID]; ok {
+			continue
+		}
+		seen[pageUUID] = struct{}{}
+		pageUUIDs = append(pageUUIDs, pageUUID)
+	}
+	if len(pageUUIDs) == 0 {
+		return states, nil
+	}
+	var corrections []types.CitationProfileCorrection
+	if err := tx.Where(
+		"tenant_id = ? AND subject_id = ? AND knowledge_base_id = ? AND subject_epoch = ? AND scope_id = ? AND event_id = ? AND page_uuid IN ?",
+		event.TenantID,
+		event.SubjectID,
+		event.KnowledgeBaseID,
+		event.SubjectEpoch,
+		event.ScopeID,
+		event.ID,
+		pageUUIDs,
+	).Order("created_at ASC, id ASC").Find(&corrections).Error; err != nil {
+		return nil, err
+	}
+	for _, correction := range corrections {
+		switch correction.CorrectionType {
+		case types.CitationCorrectionRejectMapping, types.CitationCorrectionRetractEvent:
+			states[correction.PageUUID] = types.EvidenceRelationDisputed
+		case types.CitationCorrectionConfirmRelevant:
+			states[correction.PageUUID] = types.EvidenceRelationCurrent
+		}
+	}
+	return states, nil
 }
 
 func citationResolutionSnapshot(
@@ -1280,6 +2131,27 @@ func (r *citationProfileRepository) loadLiveCitationScopeForUpdate(
 	var scope types.CitationProfileScope
 	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 		Where("tenant_id = ? AND subject_id = ? AND knowledge_base_id = ? AND deleted_at IS NULL", tenantID, subjectID, kbID).
+		First(&scope).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &scope, nil
+}
+
+func (r *citationProfileRepository) loadSharedCitationScopeForBlindDelete(
+	tx *gorm.DB,
+	authenticatedTenantID uint64,
+	subjectID string,
+	kbID string,
+) (*types.CitationProfileScope, error) {
+	var scope types.CitationProfileScope
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("acl_authenticated_tenant_id = ? AND subject_id = ? AND knowledge_base_id = ? AND deleted_at IS NULL", authenticatedTenantID, subjectID, kbID).
+		Order("tenant_id ASC").
+		Order("id ASC").
 		First(&scope).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -1453,9 +2325,13 @@ func citationProfileScopeSnapshotData(scope *types.CitationProfileScope, capture
 		}
 	}
 	watermark := strings.TrimSpace(scope.SourceUniverseWatermark)
+	eventCutoff, correctionCutoff, activeRunPointerCutoff := citationProfileScopeCutoffs(scope)
 	return map[string]interface{}{
 		"subject_epoch":                   scope.SubjectEpoch,
 		"read_version":                    fmt.Sprintf("%d", scope.ProfileReadVersion),
+		"event_cutoff":                    eventCutoff,
+		"correction_cutoff":               correctionCutoff,
+		"active_run_pointer_cutoff":       activeRunPointerCutoff,
 		"mapping_revision":                fmt.Sprintf("%d", scope.MappingRevision),
 		"source_universe_watermark":       watermark,
 		"current_index_watermark":         watermark,

@@ -42,6 +42,7 @@ func (r *citationProfileRepository) ListNodes(
 	}
 
 	var response *types.CitationProfileNodeListResponse
+	var readSnapshot *types.CitationProfileScope
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		scope, err := r.loadReadableCitationScope(tx, tenantID, subjectID, kbID)
 		if err != nil {
@@ -68,6 +69,9 @@ func (r *citationProfileRepository) ListNodes(
 		for _, page := range pages {
 			items = append(items, citationProfileNodeDTO(scope, page, counts[page.ID]))
 		}
+		if err := r.verifyCitationProfileReadSnapshot(tx, scope); err != nil {
+			return err
+		}
 
 		var nextCursor *string
 		if hasMore && len(pages) > 0 {
@@ -91,9 +95,16 @@ func (r *citationProfileRepository) ListNodes(
 			CompleteList: !hasMore,
 			Guidance:     types.CitationProfileDefaultGuidance(),
 		}
+		readSnapshot = scope
 		return nil
 	})
-	return response, err
+	if err != nil {
+		return nil, err
+	}
+	if err := r.verifyCitationProfileReadSnapshotFresh(ctx, readSnapshot); err != nil {
+		return nil, err
+	}
+	return response, nil
 }
 
 func (r *citationProfileRepository) GetGraph(
@@ -112,6 +123,7 @@ func (r *citationProfileRepository) GetGraph(
 	}
 
 	var response *types.CitationProfileGraphResponse
+	var readSnapshot *types.CitationProfileScope
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		scope, err := r.loadReadableCitationScope(tx, tenantID, subjectID, kbID)
 		if err != nil {
@@ -172,6 +184,9 @@ func (r *citationProfileRepository) GetGraph(
 				break
 			}
 		}
+		if err := r.verifyCitationProfileReadSnapshot(tx, scope); err != nil {
+			return err
+		}
 
 		response = &types.CitationProfileGraphResponse{
 			Snapshot: snapshot,
@@ -185,9 +200,16 @@ func (r *citationProfileRepository) GetGraph(
 			CompleteListURL: fmt.Sprintf("/api/v1/knowledgebase/%s/citation-profile/nodes", kbID),
 			Guidance:        types.CitationProfileDefaultGuidance(),
 		}
+		readSnapshot = scope
 		return nil
 	})
-	return response, err
+	if err != nil {
+		return nil, err
+	}
+	if err := r.verifyCitationProfileReadSnapshotFresh(ctx, readSnapshot); err != nil {
+		return nil, err
+	}
+	return response, nil
 }
 
 func (r *citationProfileRepository) ListNodeEvidence(
@@ -210,6 +232,7 @@ func (r *citationProfileRepository) ListNodeEvidence(
 	}
 
 	var response *types.CitationProfileNodeEvidenceResponse
+	var readSnapshot *types.CitationProfileScope
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		scope, err := r.loadReadableCitationScope(tx, tenantID, subjectID, kbID)
 		if err != nil {
@@ -247,6 +270,9 @@ func (r *citationProfileRepository) ListNodeEvidence(
 		}
 		corrections, err := r.loadCitationProfileCorrectionsForPage(tx, scope, pageUUID, citationProfileLinkEventIDs(links))
 		if err != nil {
+			return err
+		}
+		if err := r.verifyCitationProfileReadSnapshot(tx, scope); err != nil {
 			return err
 		}
 
@@ -287,16 +313,25 @@ func (r *citationProfileRepository) ListNodeEvidence(
 			NextCursor: nextCursor,
 			Guidance:   types.CitationProfileDefaultGuidance(),
 		}
+		readSnapshot = scope
 		return nil
 	})
-	return response, err
+	if err != nil {
+		return nil, err
+	}
+	if err := r.verifyCitationProfileReadSnapshotFresh(ctx, readSnapshot); err != nil {
+		return nil, err
+	}
+	return response, nil
 }
 
 func (r *citationProfileRepository) loadReadableCitationScope(tx *gorm.DB, tenantID uint64, subjectID string, kbID string) (*types.CitationProfileScope, error) {
 	var scope types.CitationProfileScope
-	err := tx.Where("tenant_id = ? AND subject_id = ? AND knowledge_base_id = ?", tenantID, subjectID, kbID).
+	query := tx.Where("tenant_id = ? AND subject_id = ? AND knowledge_base_id = ?", tenantID, subjectID, kbID).
+		Order("CASE WHEN deleted_at IS NULL AND fenced_at IS NULL AND enabled = TRUE THEN 0 ELSE 1 END").
 		Order("updated_at DESC").
-		First(&scope).Error
+		Order("id ASC")
+	err := query.First(&scope).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, types.ErrCitationProfileNotFound
@@ -312,10 +347,80 @@ func (r *citationProfileRepository) loadReadableCitationScope(tx *gorm.DB, tenan
 	if !scope.Enabled {
 		return nil, types.ErrCitationProfileNotFound
 	}
-	if !citationProfileScopeACLCurrent(&scope) {
-		return nil, types.ErrCitationProfileUnavailable
+	if err := r.ensureCitationProfileACLCurrentTx(tx, &scope); err != nil {
+		return nil, err
 	}
 	return &scope, nil
+}
+
+// verifyCitationProfileReadSnapshot is the final consistency fence for a
+// multi-query read. Readers deliberately do not hold a row lock while reading
+// wiki pages and links because page writers update those tables before the
+// profile scope row. Rechecking the control row at READ COMMITTED preserves a
+// linearizable delete/fence boundary without creating a lock-order cycle.
+func (r *citationProfileRepository) verifyCitationProfileReadSnapshot(tx *gorm.DB, snapshot *types.CitationProfileScope) error {
+	if snapshot == nil {
+		return types.ErrCitationProfileChanged
+	}
+	var current types.CitationProfileScope
+	err := tx.Select(
+		"id, tenant_id, subject_id, knowledge_base_id, subject_epoch, profile_read_version, "+
+			"enabled, active_run_id, mapping_revision, source_universe_watermark, "+
+			"pending_event_count, pending_mapping_count, dirty_mapping_count, acl_check_state, "+
+			"next_acl_check_at, acl_check_lease_until, acl_check_lease_token, acl_checked_at, "+
+			"acl_principal_type, acl_principal_id, acl_authenticated_tenant_id, acl_api_key_id, "+
+			"acl_access_path, acl_access_path_id, acl_generation, "+
+			"fenced_at, deleted_at, updated_at",
+	).Where(
+		"id = ? AND tenant_id = ? AND subject_id = ? AND knowledge_base_id = ?",
+		snapshot.ID, snapshot.TenantID, snapshot.SubjectID, snapshot.KnowledgeBaseID,
+	).First(&current).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return types.ErrCitationProfileDeleted
+		}
+		return err
+	}
+	if current.FencedAt != nil || current.DeletedAt != nil {
+		return types.ErrCitationProfileDeleted
+	}
+	if !current.Enabled {
+		return types.ErrCitationProfileNotFound
+	}
+	if err := r.ensureCitationProfileACLCurrentTx(tx, &current); err != nil {
+		return err
+	}
+	if current.SubjectEpoch != snapshot.SubjectEpoch ||
+		current.ProfileReadVersion != snapshot.ProfileReadVersion ||
+		current.ActiveRunID != snapshot.ActiveRunID ||
+		current.MappingRevision != snapshot.MappingRevision ||
+		current.SourceUniverseWatermark != snapshot.SourceUniverseWatermark ||
+		current.PendingEventCount != snapshot.PendingEventCount ||
+		current.PendingMappingCount != snapshot.PendingMappingCount ||
+		current.DirtyMappingCount != snapshot.DirtyMappingCount ||
+		current.ACLCheckState != snapshot.ACLCheckState ||
+		!current.UpdatedAt.Equal(snapshot.UpdatedAt) {
+		return types.ErrCitationProfileChanged
+	}
+	return nil
+}
+
+// verifyCitationProfileReadSnapshotFresh runs after the read transaction has
+// ended. PostgreSQL's READ COMMITTED already refreshes each statement, while
+// SQLite/WAL pins a read snapshot at the first SELECT. This second control-row
+// fence therefore closes the SQLite visibility gap without holding a lock
+// across the potentially large page/evidence read.
+func (r *citationProfileRepository) verifyCitationProfileReadSnapshotFresh(
+	ctx context.Context,
+	snapshot *types.CitationProfileScope,
+) error {
+	if r == nil || r.db == nil {
+		return types.ErrCitationProfileUnavailable
+	}
+	return r.verifyCitationProfileReadSnapshot(
+		r.db.WithContext(ctx).Session(&gorm.Session{NewDB: true}),
+		snapshot,
+	)
 }
 
 func (r *citationProfileRepository) loadCitationProfilePages(tx *gorm.DB, scope *types.CitationProfileScope, afterPageUUID string, limit int) ([]types.WikiPage, bool, error) {
@@ -387,7 +492,8 @@ func citationProfileNodeCountsFromLinks(
 ) map[string]citationProfileNodeCount {
 	counts := make(map[string]citationProfileNodeCount, len(links))
 	for _, link := range links {
-		if _, ok := liveEvents[link.EventID]; !ok {
+		event, ok := liveEvents[link.EventID]
+		if !ok {
 			continue
 		}
 		count := counts[link.PageUUID]
@@ -398,6 +504,9 @@ func citationProfileNodeCountsFromLinks(
 				relationState = types.EvidenceRelationHistorical
 				count.StaleMapping = true
 			}
+		}
+		if event.Status == types.CitationProfileEventStatusPendingResolution {
+			count.StaleMapping = true
 		}
 		switch relationState {
 		case types.EvidenceRelationCurrent:
@@ -671,14 +780,7 @@ func citationProfileNodeStale(scope *types.CitationProfileScope, count citationP
 	if scope == nil || count.AuthorizedEvidenceCount == 0 {
 		return false
 	}
-	if count.StaleMapping {
-		return true
-	}
-	if count.LatestMappingRevision > 0 && count.LatestMappingRevision < scope.MappingRevision {
-		return true
-	}
-	currentWatermark := strings.TrimSpace(scope.SourceUniverseWatermark)
-	return currentWatermark != "" && count.LatestUniverseWatermark != "" && count.LatestUniverseWatermark != currentWatermark
+	return count.StaleMapping
 }
 
 func citationProfileEvidenceItem(
@@ -707,7 +809,9 @@ func citationProfileEvidenceItem(
 	if runWatermark == "" {
 		runWatermark = link.UniverseWatermark
 	}
-	staleMapping := citationProfileLinkStale(scope, link, currentSourceRefs)
+	staleMapping := citationProfileLinkStale(scope, link, currentSourceRefs) ||
+		event.Status == types.CitationProfileEventStatusPendingResolution ||
+		(strings.TrimSpace(event.ActiveRunID) != "" && event.ActiveRunID != link.ResolutionRunID)
 	overlay := link.RelationState
 	if overlay == types.EvidenceRelationCurrent && staleMapping {
 		overlay = types.EvidenceRelationHistorical
@@ -766,11 +870,7 @@ func citationProfileLinkStale(scope *types.CitationProfileScope, link types.Evid
 			return true
 		}
 	}
-	if link.MappingRevision > 0 && link.MappingRevision < scope.MappingRevision {
-		return true
-	}
-	currentWatermark := strings.TrimSpace(scope.SourceUniverseWatermark)
-	return currentWatermark != "" && link.UniverseWatermark != "" && link.UniverseWatermark != currentWatermark
+	return false
 }
 
 func citationProfileCorrectionState(event types.CitationProfileEvent, corrections []types.CitationProfileCorrection) string {
@@ -826,6 +926,13 @@ func citationProfileCursorMatchesScope(scope *types.CitationProfileScope, cursor
 		cursor.ActiveRunPointerCutoff != snapshot.ActiveRunPointerCutoff ||
 		cursor.CurrentIndexWatermark != snapshot.CurrentIndexWatermark ||
 		cursor.CurrentWikiUniverseWatermark != snapshot.CurrentWikiUniverseWatermark ||
+		cursor.MappingRevision != snapshot.MappingRevision ||
+		cursor.SourceUniverseWatermark != snapshot.SourceUniverseWatermark ||
+		cursor.DirtyEventCount != snapshot.DirtyEventCount ||
+		cursor.PendingEventCount != snapshot.PendingEventCount ||
+		cursor.PendingMappingCount != snapshot.PendingMappingCount ||
+		cursor.DirtyMappingCount != snapshot.DirtyMappingCount ||
+		cursor.Sort != types.CitationProfileCursorSortIDAsc ||
 		cursor.PageSize != pageSize {
 		return types.ErrCitationProfileChanged
 	}
@@ -838,7 +945,7 @@ func citationProfileCursorFromSnapshot(endpoint string, kbID string, pageSize in
 		Endpoint:        endpoint,
 		KnowledgeBaseID: kbID,
 		PageSize:        pageSize,
-		Sort:            "id_asc",
+		Sort:            types.CitationProfileCursorSortIDAsc,
 		LastPageUUID:    lastPageUUID,
 		LastRelationID:  lastRelationID,
 	}
@@ -850,6 +957,13 @@ func citationProfileCursorFromSnapshot(endpoint string, kbID string, pageSize in
 		cursor.ActiveRunPointerCutoff = snapshot.ActiveRunPointerCutoff
 		cursor.CurrentIndexWatermark = snapshot.CurrentIndexWatermark
 		cursor.CurrentWikiUniverseWatermark = snapshot.CurrentWikiUniverseWatermark
+		cursor.MappingRevision = snapshot.MappingRevision
+		cursor.SourceUniverseWatermark = snapshot.SourceUniverseWatermark
+		cursor.DirtyEventCount = snapshot.DirtyEventCount
+		cursor.PendingEventCount = snapshot.PendingEventCount
+		cursor.PendingMappingCount = snapshot.PendingMappingCount
+		cursor.DirtyMappingCount = snapshot.DirtyMappingCount
+		cursor.CapturedAt = snapshot.CapturedAt
 	}
 	return cursor
 }
@@ -871,9 +985,13 @@ func citationProfileScopeSnapshotDTO(scope *types.CitationProfileScope, captured
 		return &types.CitationProfileSnapshot{ReadVersion: "0", CapturedAt: citationTime(capturedAt)}
 	}
 	watermark := strings.TrimSpace(scope.SourceUniverseWatermark)
+	eventCutoff, correctionCutoff, activeRunPointerCutoff := citationProfileScopeCutoffs(scope)
 	return &types.CitationProfileSnapshot{
 		SubjectEpoch:                 scope.SubjectEpoch,
 		ReadVersion:                  strconv.FormatUint(scope.ProfileReadVersion, 10),
+		EventCutoff:                  eventCutoff,
+		CorrectionCutoff:             correctionCutoff,
+		ActiveRunPointerCutoff:       activeRunPointerCutoff,
 		MappingRevision:              strconv.FormatUint(scope.MappingRevision, 10),
 		SourceUniverseWatermark:      watermark,
 		CurrentIndexWatermark:        watermark,
@@ -884,4 +1002,11 @@ func citationProfileScopeSnapshotDTO(scope *types.CitationProfileScope, captured
 		DirtyMappingCount:            scope.DirtyMappingCount,
 		CapturedAt:                   citationTime(capturedAt),
 	}
+}
+
+// The control row serializes every profile mutation. These opaque, typed
+// tokens therefore bind all three mutable projections to the same monotonic
+// read version while retaining a human-auditable state timestamp.
+func citationProfileScopeCutoffs(scope *types.CitationProfileScope) (string, string, string) {
+	return types.CitationProfileScopeSnapshotCutoffs(scope)
 }

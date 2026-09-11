@@ -13,11 +13,12 @@ import (
 var ErrTenantAPIKeyNotFound = errors.New("tenant api key not found")
 
 type tenantAPIKeyRepository struct {
-	db *gorm.DB
+	db                 *gorm.DB
+	citationProfileACL citationProfileACLInvalidationGate
 }
 
-func NewTenantAPIKeyRepository(db *gorm.DB) interfaces.TenantAPIKeyRepository {
-	return &tenantAPIKeyRepository{db: db}
+func NewTenantAPIKeyRepository(db *gorm.DB, citationProfileConfig *types.CitationProfileConfig) interfaces.TenantAPIKeyRepository {
+	return &tenantAPIKeyRepository{db: db, citationProfileACL: newCitationProfileACLInvalidationGate(citationProfileConfig)}
 }
 
 func (r *tenantAPIKeyRepository) CreateAPIKey(ctx context.Context, key *types.TenantAPIKey) error {
@@ -61,31 +62,40 @@ func (r *tenantAPIKeyRepository) ListPlatformAPIKeys(ctx context.Context) ([]*ty
 func (r *tenantAPIKeyRepository) UpdateAPIKey(
 	ctx context.Context, tenantID uint64, id uint64, update *types.TenantAPIKey,
 ) (*types.TenantAPIKey, error) {
-	res := r.db.WithContext(ctx).
-		Model(&types.TenantAPIKey{}).
-		Where("id = ? AND tenant_id = ? AND scope_type = ? AND revoked_at IS NULL",
-			id, tenantID, types.APIKeyScopeTenant).
-		Updates(map[string]any{
-			"name":               update.Name,
-			"full_access":        update.FullAccess,
-			"knowledge_base_ids": update.KnowledgeBaseIDs,
-			"capabilities":       update.Capabilities,
-			"expires_at":         update.ExpiresAt,
-		})
-	if res.Error != nil {
-		return nil, res.Error
-	}
-	if res.RowsAffected == 0 {
-		return nil, ErrTenantAPIKeyNotFound
-	}
-
 	var updatedKey types.TenantAPIKey
-	if err := r.db.WithContext(ctx).
-		Where("id = ? AND tenant_id = ? AND revoked_at IS NULL", id, tenantID).
-		First(&updatedKey).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, ErrTenantAPIKeyNotFound
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		res := tx.Model(&types.TenantAPIKey{}).
+			Where("id = ? AND tenant_id = ? AND scope_type = ? AND revoked_at IS NULL",
+				id, tenantID, types.APIKeyScopeTenant).
+			Updates(map[string]any{
+				"name":               update.Name,
+				"full_access":        update.FullAccess,
+				"knowledge_base_ids": update.KnowledgeBaseIDs,
+				"capabilities":       update.Capabilities,
+				"expires_at":         update.ExpiresAt,
+			})
+		if res.Error != nil {
+			return res.Error
 		}
+		if res.RowsAffected == 0 {
+			return ErrTenantAPIKeyNotFound
+		}
+		if err := r.citationProfileACL.invalidate(tx, types.CitationProfileACLMutation{
+			AuthenticatedTenantID: tenantID,
+			APIKeyID:              id,
+		}, time.Now().UTC()); err != nil {
+			return err
+		}
+		if err := tx.Where("id = ? AND tenant_id = ? AND revoked_at IS NULL", id, tenantID).
+			First(&updatedKey).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrTenantAPIKeyNotFound
+			}
+			return err
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
 	return &updatedKey, nil
@@ -93,32 +103,37 @@ func (r *tenantAPIKeyRepository) UpdateAPIKey(
 
 func (r *tenantAPIKeyRepository) RevokeAPIKey(ctx context.Context, tenantID uint64, id uint64) error {
 	now := time.Now().UTC()
-	res := r.db.WithContext(ctx).
-		Model(&types.TenantAPIKey{}).
-		Where("id = ? AND tenant_id = ? AND revoked_at IS NULL", id, tenantID).
-		Update("revoked_at", &now)
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return ErrTenantAPIKeyNotFound
-	}
-	return nil
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		res := tx.Model(&types.TenantAPIKey{}).
+			Where("id = ? AND tenant_id = ? AND revoked_at IS NULL", id, tenantID).
+			Update("revoked_at", &now)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrTenantAPIKeyNotFound
+		}
+		return r.citationProfileACL.invalidate(tx, types.CitationProfileACLMutation{
+			AuthenticatedTenantID: tenantID,
+			APIKeyID:              id,
+		}, now)
+	})
 }
 
 func (r *tenantAPIKeyRepository) RevokePlatformAPIKey(ctx context.Context, id uint64) error {
 	now := time.Now().UTC()
-	res := r.db.WithContext(ctx).
-		Model(&types.TenantAPIKey{}).
-		Where("id = ? AND scope_type = ? AND revoked_at IS NULL", id, types.APIKeyScopePlatform).
-		Update("revoked_at", &now)
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return ErrTenantAPIKeyNotFound
-	}
-	return nil
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		res := tx.Model(&types.TenantAPIKey{}).
+			Where("id = ? AND scope_type = ? AND revoked_at IS NULL", id, types.APIKeyScopePlatform).
+			Update("revoked_at", &now)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrTenantAPIKeyNotFound
+		}
+		return r.citationProfileACL.invalidate(tx, types.CitationProfileACLMutation{APIKeyID: id}, now)
+	})
 }
 
 func (r *tenantAPIKeyRepository) UpdateAPIKeyHash(ctx context.Context, id uint64, hash string) error {

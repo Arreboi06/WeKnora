@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -1460,6 +1461,10 @@ func (h *Handler) persistCompletedAssistantMessage(ctx context.Context, assistan
 	if h.citationProfileService != nil {
 		handled, err := h.citationProfileService.CompleteAssistantMessage(ctx, assistantMessage)
 		if err != nil {
+			if handled && stderrors.Is(err, types.ErrCitationProfileCommitted) {
+				logger.Warnf(ctx, "citation profile: message committed; evidence resolution queued for recovery")
+				return true
+			}
 			logger.Warnf(ctx, "citation profile: complete assistant message failed for %s: %v", assistantMessage.ID, err)
 			return false
 		}

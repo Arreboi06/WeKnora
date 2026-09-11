@@ -3,10 +3,13 @@ package repository
 import (
 	"context"
 	"errors"
+	"sort"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var (
@@ -16,27 +19,32 @@ var (
 
 // kbShareRepository implements KBShareRepository interface
 type kbShareRepository struct {
-	db *gorm.DB
+	db                 *gorm.DB
+	citationProfileACL citationProfileACLInvalidationGate
 }
 
 // NewKBShareRepository creates a new knowledge base share repository
-func NewKBShareRepository(db *gorm.DB) interfaces.KBShareRepository {
-	return &kbShareRepository{db: db}
+func NewKBShareRepository(db *gorm.DB, citationProfileConfig *types.CitationProfileConfig) interfaces.KBShareRepository {
+	return &kbShareRepository{db: db, citationProfileACL: newCitationProfileACLInvalidationGate(citationProfileConfig)}
 }
 
 // Create creates a new share record
 func (r *kbShareRepository) Create(ctx context.Context, share *types.KnowledgeBaseShare) error {
-	// Check if share already exists
-	var count int64
-	r.db.WithContext(ctx).Model(&types.KnowledgeBaseShare{}).
-		Where("knowledge_base_id = ? AND organization_id = ? AND deleted_at IS NULL", share.KnowledgeBaseID, share.OrganizationID).
-		Count(&count)
-
-	if count > 0 {
-		return ErrKBShareAlreadyExists
-	}
-
-	return r.db.WithContext(ctx).Create(share).Error
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var count int64
+		if err := tx.Model(&types.KnowledgeBaseShare{}).
+			Where("knowledge_base_id = ? AND organization_id = ? AND deleted_at IS NULL", share.KnowledgeBaseID, share.OrganizationID).
+			Count(&count).Error; err != nil {
+			return err
+		}
+		if count > 0 {
+			return ErrKBShareAlreadyExists
+		}
+		if err := tx.Create(share).Error; err != nil {
+			return err
+		}
+		return r.citationProfileACL.invalidate(tx, citationProfileKBShareMutation(share), time.Now().UTC())
+	})
 }
 
 // GetByID gets a share record by ID
@@ -73,33 +81,113 @@ func (r *kbShareRepository) GetByKBAndOrg(ctx context.Context, kbID string, orgI
 
 // Update updates a share record
 func (r *kbShareRepository) Update(ctx context.Context, share *types.KnowledgeBaseShare) error {
-	return r.db.WithContext(ctx).Model(&types.KnowledgeBaseShare{}).
-		Where("id = ?", share.ID).
-		Updates(share).Error
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var previous types.KnowledgeBaseShare
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", share.ID).First(&previous).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		if err := tx.Model(&types.KnowledgeBaseShare{}).Where("id = ?", share.ID).Updates(share).Error; err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		mutations := []types.CitationProfileACLMutation{citationProfileKBShareMutation(&previous)}
+		if previous.SourceTenantID != share.SourceTenantID || previous.KnowledgeBaseID != share.KnowledgeBaseID {
+			mutations = append(mutations, citationProfileKBShareMutation(share))
+		}
+		return r.citationProfileACL.invalidateMany(tx, mutations, now)
+	})
 }
 
 // Delete soft deletes a share record
 func (r *kbShareRepository) Delete(ctx context.Context, id string) error {
-	return r.db.WithContext(ctx).Where("id = ?", id).Delete(&types.KnowledgeBaseShare{}).Error
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var share types.KnowledgeBaseShare
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", id).First(&share).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		if err := tx.Where("id = ?", id).Delete(&types.KnowledgeBaseShare{}).Error; err != nil {
+			return err
+		}
+		return r.citationProfileACL.invalidate(tx, citationProfileKBShareMutation(&share), time.Now().UTC())
+	})
 }
 
 // DeleteByKnowledgeBaseID soft deletes all share records for a knowledge base (e.g. when the KB is deleted)
 func (r *kbShareRepository) DeleteByKnowledgeBaseID(ctx context.Context, kbID string) error {
-	return r.db.WithContext(ctx).Where("knowledge_base_id = ?", kbID).Delete(&types.KnowledgeBaseShare{}).Error
+	return r.deleteCitationProfileKBShares(ctx, "knowledge_base_id = ?", kbID)
 }
 
 // DeleteByOrganizationID soft deletes all share records for an organization (e.g. when the org is deleted)
 func (r *kbShareRepository) DeleteByOrganizationID(ctx context.Context, orgID string) error {
-	return r.db.WithContext(ctx).Where("organization_id = ?", orgID).Delete(&types.KnowledgeBaseShare{}).Error
+	return r.deleteCitationProfileKBShares(ctx, "organization_id = ?", orgID)
+}
+
+func (r *kbShareRepository) deleteCitationProfileKBShares(ctx context.Context, predicate string, value interface{}) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var shares []types.KnowledgeBaseShare
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where(predicate, value).
+			Order("source_tenant_id ASC").Order("knowledge_base_id ASC").Order("id ASC").
+			Find(&shares).Error; err != nil {
+			return err
+		}
+		if err := tx.Where(predicate, value).Delete(&types.KnowledgeBaseShare{}).Error; err != nil {
+			return err
+		}
+		sort.Slice(shares, func(i, j int) bool {
+			if shares[i].SourceTenantID != shares[j].SourceTenantID {
+				return shares[i].SourceTenantID < shares[j].SourceTenantID
+			}
+			if shares[i].KnowledgeBaseID != shares[j].KnowledgeBaseID {
+				return shares[i].KnowledgeBaseID < shares[j].KnowledgeBaseID
+			}
+			return shares[i].ID < shares[j].ID
+		})
+		now := time.Now().UTC()
+		mutations := make([]types.CitationProfileACLMutation, 0, len(shares))
+		var lastSource uint64
+		var lastKB string
+		for i := range shares {
+			if i > 0 && shares[i].SourceTenantID == lastSource && shares[i].KnowledgeBaseID == lastKB {
+				continue
+			}
+			mutations = append(mutations, citationProfileKBShareMutation(&shares[i]))
+			lastSource = shares[i].SourceTenantID
+			lastKB = shares[i].KnowledgeBaseID
+		}
+		if len(mutations) == 0 {
+			return nil
+		}
+		return r.citationProfileACL.invalidateMany(tx, mutations, now)
+	})
+}
+
+func invalidateCitationProfileKBShareTx(tx *gorm.DB, share *types.KnowledgeBaseShare, now time.Time) error {
+	return invalidateCitationProfileACLTx(tx, citationProfileKBShareMutation(share), now)
+}
+
+func citationProfileKBShareMutation(share *types.KnowledgeBaseShare) types.CitationProfileACLMutation {
+	return types.CitationProfileACLMutation{
+		SourceTenantID:  share.SourceTenantID,
+		KnowledgeBaseID: share.KnowledgeBaseID,
+		AccessPath:      types.CitationProfileACLAccessPathKBShare,
+	}
 }
 
 // ListByKnowledgeBase lists all share records for a knowledge base
 func (r *kbShareRepository) ListByKnowledgeBase(ctx context.Context, kbID string) ([]*types.KnowledgeBaseShare, error) {
 	var shares []*types.KnowledgeBaseShare
 	err := r.db.WithContext(ctx).
+		Joins("JOIN organizations ON organizations.id = kb_shares.organization_id AND organizations.deleted_at IS NULL").
 		Preload("Organization").
-		Where("knowledge_base_id = ?", kbID).
-		Order("created_at DESC").
+		Where("kb_shares.knowledge_base_id = ? AND kb_shares.deleted_at IS NULL", kbID).
+		Order("kb_shares.created_at DESC").
 		Find(&shares).Error
 
 	if err != nil {

@@ -228,7 +228,7 @@ export interface CitationProfileDeleteRequest {
 export interface CitationProfileDeleteResponse {
   operation_id: CitationProfileUuid
   status: 'accepted'
-  receipt_code: 'profile_hidden_purge_scheduled'
+  receipt_code: 'profile_hidden_and_fenced'
 }
 
 export interface CitationProfileBlindDeleteResponse {
@@ -314,12 +314,12 @@ async function requestGet<T>(url: string, config?: unknown): Promise<T> {
 
 async function requestPost<T>(url: string, body?: unknown, config?: unknown): Promise<T> {
   const { post } = await import('../../utils/request')
-  return post<T>(url, body, config)
+  return post<T>(url, body as any, config)
 }
 
 async function requestPut<T>(url: string, body?: unknown, config?: unknown): Promise<T> {
   const { put } = await import('../../utils/request')
-  return put<T>(url, body, config)
+  return put<T>(url, body as any, config)
 }
 
 const defaultTransport: CitationProfileTransport = {
@@ -394,7 +394,7 @@ export function createCitationProfileClient(transport: CitationProfileTransport 
     },
     deleteCurrentProfile(kbId: string, body?: CitationProfileDeleteRequest) {
       return transport.delete<CitationProfileDeleteResponse>(
-        `/api/v1/knowledgebase/${encodePath(kbId)}/citation-profile`,
+        `/api/v1/knowledgebase/${encodePath(kbId)}/citation-profile/`,
         body,
         csrfConfig,
       )

@@ -2,22 +2,292 @@ package service
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/application/repository"
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
 
+func TestUpdateAutoLinkedContentBacklinkDoesNotInvalidateTargetCitationEvidence(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(
+		&types.WikiPage{},
+		&types.WikiSourceRefIndex{},
+		&types.CitationProfileScope{},
+		&types.CitationProfileEvent{},
+		&types.CitationProfileEventOutbox{},
+		&types.EvidenceNodeLink{},
+	))
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	checkedAt := now.Add(-time.Minute)
+	nextCheckAt := now.Add(time.Hour)
+	scope := &types.CitationProfileScope{
+		ID:                       "scope-backlink-no-invalidation",
+		TenantID:                 7,
+		SubjectID:                "user-backlink-no-invalidation",
+		KnowledgeBaseID:          "kb-backlink-no-invalidation",
+		SubjectEpoch:             "epoch-backlink-no-invalidation",
+		ProfileReadVersion:       1,
+		ProfilePolicyVersion:     types.CitationProfilePolicyVersion,
+		RetentionPolicyVersion:   types.CitationProfileRetentionPolicyVersion,
+		Enabled:                  true,
+		ACLCheckState:            types.CitationProfileACLStateCurrent,
+		ACLCheckedAt:             &checkedAt,
+		NextACLCheckAt:           &nextCheckAt,
+		ACLPrincipalType:         types.PrincipalWebUser,
+		ACLPrincipalID:           "user-backlink-no-invalidation",
+		ACLAuthenticatedTenantID: 7,
+		ACLAccessPath:            types.CitationProfileACLAccessPathOwner,
+		ACLGeneration:            1,
+		PendingEventCount:        1,
+		CreatedAt:                now,
+		UpdatedAt:                now,
+	}
+	require.NoError(t, db.Create(scope).Error)
+	wikiRepo := repository.NewWikiPageRepository(db, &types.CitationProfileConfig{Enabled: true})
+	svc := NewWikiPageService(wikiRepo, nil, nil, nil, nil)
+	target := &types.WikiPage{
+		ID:              "page-backlink-target",
+		TenantID:        scope.TenantID,
+		KnowledgeBaseID: scope.KnowledgeBaseID,
+		Slug:            "doc/backlink-target",
+		Title:           "Backlink target",
+		PageType:        types.WikiPageTypeConcept,
+		Status:          types.WikiPageStatusPublished,
+		Version:         1,
+		SourceRefs:      types.StringArray{"knowledge-backlink-target|Source"},
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	source := &types.WikiPage{
+		ID:              "page-backlink-source",
+		TenantID:        scope.TenantID,
+		KnowledgeBaseID: scope.KnowledgeBaseID,
+		Slug:            "doc/backlink-source",
+		Title:           "Backlink source",
+		PageType:        types.WikiPageTypeConcept,
+		Status:          types.WikiPageStatusPublished,
+		Version:         1,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	require.NoError(t, wikiRepo.Create(ctx, target))
+	require.NoError(t, wikiRepo.Create(ctx, source))
+
+	resolvedAt := now.Add(time.Second)
+	deliveredAt := resolvedAt.Add(time.Second)
+	event := &types.CitationProfileEvent{
+		ID:                 "event-backlink-target",
+		TenantID:           scope.TenantID,
+		SubjectID:          scope.SubjectID,
+		KnowledgeBaseID:    scope.KnowledgeBaseID,
+		SubjectEpoch:       scope.SubjectEpoch,
+		ScopeID:            scope.ID,
+		MessageID:          "message-backlink-target",
+		SourceKnowledgeID:  "knowledge-backlink-target",
+		SourceRefsSnapshot: json.RawMessage(`{}`),
+		KnowledgeSnapshot:  json.RawMessage(`{}`),
+		KnowledgeBaseProof: json.RawMessage(`{}`),
+		ProducerEventKey:   "producer-backlink-target",
+		Status:             types.CitationProfileEventStatusResolved,
+		ActiveRunID:        "run-backlink-target",
+		ResolvedAt:         &resolvedAt,
+		CreatedAt:          now,
+		UpdatedAt:          resolvedAt,
+	}
+	require.NoError(t, db.Create(event).Error)
+	require.NoError(t, db.Create(&types.EvidenceNodeLink{
+		ID:                "link-backlink-target",
+		TenantID:          scope.TenantID,
+		SubjectID:         scope.SubjectID,
+		KnowledgeBaseID:   scope.KnowledgeBaseID,
+		SubjectEpoch:      scope.SubjectEpoch,
+		ScopeID:           scope.ID,
+		EventID:           event.ID,
+		ResolutionRunID:   event.ActiveRunID,
+		SourceKnowledgeID: event.SourceKnowledgeID,
+		PageUUID:          target.ID,
+		PageVersion:       target.Version,
+		NormalizedRef:     event.SourceKnowledgeID,
+		RelationState:     types.EvidenceRelationCurrent,
+		RelationSource:    "source_ref_index",
+		MappingRevision:   uint64(target.Version),
+		UniverseWatermark: "stable-before-backlink",
+		CreatedAt:         resolvedAt,
+	}).Error)
+	require.NoError(t, db.Create(&types.CitationProfileEventOutbox{
+		ID:              "outbox-backlink-target",
+		TenantID:        scope.TenantID,
+		SubjectID:       scope.SubjectID,
+		KnowledgeBaseID: scope.KnowledgeBaseID,
+		SubjectEpoch:    scope.SubjectEpoch,
+		ScopeID:         scope.ID,
+		EventID:         event.ID,
+		Status:          types.CitationProfileOutboxStatusDelivered,
+		AttemptCount:    3,
+		NextAttemptAt:   deliveredAt,
+		DeliveredAt:     &deliveredAt,
+		CreatedAt:       now,
+		UpdatedAt:       deliveredAt,
+	}).Error)
+	require.NoError(t, db.Model(&types.CitationProfileScope{}).Where("id = ?", scope.ID).Updates(map[string]interface{}{
+		"pending_event_count":   0,
+		"dirty_mapping_count":   0,
+		"pending_mapping_count": 0,
+	}).Error)
+
+	source.Content = "See [[" + target.Slug + "]]"
+	require.NoError(t, svc.UpdateAutoLinkedContent(ctx, source))
+	require.NoError(t, svc.RebuildLinks(ctx, scope.KnowledgeBaseID),
+		"a consistency rebuild over an already-correct graph must be evidence-neutral")
+
+	var storedTarget types.WikiPage
+	require.NoError(t, db.First(&storedTarget, "id = ?", target.ID).Error)
+	require.Equal(t, types.StringArray{source.Slug}, storedTarget.InLinks)
+	var storedEvent types.CitationProfileEvent
+	require.NoError(t, db.First(&storedEvent, "id = ?", event.ID).Error)
+	require.Equal(t, types.CitationProfileEventStatusResolved, storedEvent.Status)
+	require.Equal(t, event.ActiveRunID, storedEvent.ActiveRunID)
+	require.NotNil(t, storedEvent.ResolvedAt)
+	var storedLink types.EvidenceNodeLink
+	require.NoError(t, db.First(&storedLink, "id = ?", "link-backlink-target").Error)
+	require.Equal(t, types.EvidenceRelationCurrent, storedLink.RelationState)
+	var storedOutbox types.CitationProfileEventOutbox
+	require.NoError(t, db.First(&storedOutbox, "id = ?", "outbox-backlink-target").Error)
+	require.Equal(t, types.CitationProfileOutboxStatusDelivered, storedOutbox.Status)
+	require.Equal(t, 3, storedOutbox.AttemptCount)
+	require.NotNil(t, storedOutbox.DeliveredAt)
+	var storedScope types.CitationProfileScope
+	require.NoError(t, db.First(&storedScope, "id = ?", scope.ID).Error)
+	require.Zero(t, storedScope.PendingEventCount)
+	require.Zero(t, storedScope.DirtyMappingCount)
+}
+
+func TestRebuildLinksPersistsBothDirectionsAndReturnsWriteFailures(t *testing.T) {
+	setup := func(t *testing.T) (*gorm.DB, interfaces.WikiPageRepository, interfaces.WikiPageService, *types.WikiPage, *types.WikiPage) {
+		t.Helper()
+		db, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())), &gorm.Config{})
+		require.NoError(t, err)
+		require.NoError(t, db.AutoMigrate(&types.WikiPage{}))
+		repo := repository.NewWikiPageRepository(db)
+		svc := NewWikiPageService(repo, nil, nil, nil, nil)
+		now := time.Now().UTC()
+		target := &types.WikiPage{
+			ID: "rebuild-target", TenantID: 1, KnowledgeBaseID: "kb-rebuild", Slug: "doc/rebuild-target",
+			Title: "Target", PageType: types.WikiPageTypeConcept, Status: types.WikiPageStatusPublished,
+			Version: 1, CreatedAt: now, UpdatedAt: now,
+		}
+		source := &types.WikiPage{
+			ID: "rebuild-source", TenantID: 1, KnowledgeBaseID: "kb-rebuild", Slug: "doc/rebuild-source",
+			Title: "Source", Content: "See [[doc/rebuild-target]]", PageType: types.WikiPageTypeConcept,
+			Status: types.WikiPageStatusPublished, Version: 1, CreatedAt: now, UpdatedAt: now,
+		}
+		require.NoError(t, repo.Create(context.Background(), target))
+		require.NoError(t, repo.Create(context.Background(), source))
+		return db, repo, svc, source, target
+	}
+
+	t.Run("persists outbound and inbound sets", func(t *testing.T) {
+		_, _, svc, source, target := setup(t)
+		require.NoError(t, svc.RebuildLinks(context.Background(), source.KnowledgeBaseID))
+		storedSource, err := svc.GetPageBySlug(context.Background(), source.KnowledgeBaseID, source.Slug)
+		require.NoError(t, err)
+		require.Equal(t, types.StringArray{target.Slug}, storedSource.OutLinks)
+		storedTarget, err := svc.GetPageBySlug(context.Background(), target.KnowledgeBaseID, target.Slug)
+		require.NoError(t, err)
+		require.Equal(t, types.StringArray{source.Slug}, storedTarget.InLinks)
+	})
+
+	t.Run("does not report success after a partial write failure", func(t *testing.T) {
+		db, _, svc, source, _ := setup(t)
+		injected := errors.New("injected rebuild write failure")
+		callback := "p36_rebuild_links_write_failure"
+		require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callback, func(tx *gorm.DB) {
+			if tx.Statement != nil && tx.Statement.Table == "wiki_pages" {
+				tx.AddError(injected)
+			}
+		}))
+		t.Cleanup(func() { _ = db.Callback().Update().Remove(callback) })
+		err := svc.RebuildLinks(context.Background(), source.KnowledgeBaseID)
+		require.ErrorIs(t, err, injected)
+	})
+}
+
+func TestWikiPageServiceRejectsStalePayloadBeforeBindingFreshRepositoryToken(t *testing.T) {
+	newService := func(t *testing.T) interfaces.WikiPageService {
+		t.Helper()
+		db, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())), &gorm.Config{})
+		require.NoError(t, err)
+		require.NoError(t, db.AutoMigrate(&types.WikiPage{}, &types.WikiPageRevision{}, &types.WikiFolder{}))
+		return NewWikiPageService(repository.NewWikiPageRepository(db), nil, nil, nil, nil)
+	}
+
+	t.Run("user update", func(t *testing.T) {
+		svc := newService(t)
+		created, err := svc.CreatePage(context.Background(), &types.WikiPage{
+			TenantID: 1, KnowledgeBaseID: "kb-stale-user", Slug: "doc/stale-user",
+			Title: "v1", Content: "v1", PageType: types.WikiPageTypeConcept,
+		})
+		require.NoError(t, err)
+		stale := *created
+		winner := *created
+		winner.Title = "winner-v2"
+		winner.Content = "winner-v2"
+		committed, err := svc.UpdatePage(context.Background(), &winner)
+		require.NoError(t, err)
+		require.Equal(t, 2, committed.Version)
+
+		stale.Title = "stale-v1-edit"
+		stale.Content = "stale-v1-edit"
+		_, err = svc.UpdatePage(context.Background(), &stale)
+		require.ErrorIs(t, err, repository.ErrWikiPageConflict)
+		stored, err := svc.GetPageBySlug(context.Background(), created.KnowledgeBaseID, created.Slug)
+		require.NoError(t, err)
+		require.Equal(t, "winner-v2", stored.Content)
+		require.Equal(t, 2, stored.Version)
+	})
+
+	t.Run("automatic decorator", func(t *testing.T) {
+		svc := newService(t)
+		created, err := svc.CreatePage(context.Background(), &types.WikiPage{
+			TenantID: 1, KnowledgeBaseID: "kb-stale-auto", Slug: "doc/stale-auto",
+			Title: "v1", Content: "v1", PageType: types.WikiPageTypeConcept,
+		})
+		require.NoError(t, err)
+		staleDecorator := *created
+		winner := *created
+		winner.Title = "winner-v2"
+		winner.Content = "winner-v2"
+		committed, err := svc.UpdatePage(context.Background(), &winner)
+		require.NoError(t, err)
+		require.Equal(t, 2, committed.Version)
+
+		staleDecorator.Content = "decorated-v1 [[doc/target]]"
+		err = svc.UpdateAutoLinkedContent(context.Background(), &staleDecorator)
+		require.ErrorIs(t, err, repository.ErrWikiPageConflict)
+		stored, err := svc.GetPageBySlug(context.Background(), created.KnowledgeBaseID, created.Slug)
+		require.NoError(t, err)
+		require.Equal(t, "winner-v2", stored.Content)
+		require.Equal(t, 2, stored.Version)
+	})
+}
+
 func TestPruneEmptyFolderChainsDeletesOnlyEmptyCandidateAncestors(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&types.WikiFolder{}, &types.WikiPage{}, &types.WikiPageRevision{}))
+	require.NoError(t, db.AutoMigrate(&types.WikiFolder{}, &types.WikiPage{}, &types.WikiPageRevision{}, &types.WikiSourceRefIndex{}, &types.EvidenceNodeLink{}, &types.CitationProfileEvent{}, &types.CitationProfileScope{}, &types.CitationProfileEventOutbox{}))
 
 	ctx := context.Background()
 	repo := repository.NewWikiPageRepository(db)
@@ -73,7 +343,7 @@ func TestStripWikiInlineChunkCitationsPreservesOrdinaryMarkdown(t *testing.T) {
 func TestUpdateWikiPagePersistsAndClearsAliases(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&types.WikiFolder{}, &types.WikiPage{}, &types.WikiPageRevision{}))
+	require.NoError(t, db.AutoMigrate(&types.WikiFolder{}, &types.WikiPage{}, &types.WikiPageRevision{}, &types.WikiSourceRefIndex{}, &types.EvidenceNodeLink{}, &types.CitationProfileEvent{}, &types.CitationProfileScope{}, &types.CitationProfileEventOutbox{}))
 
 	ctx := context.Background()
 	repo := repository.NewWikiPageRepository(db)
@@ -176,7 +446,7 @@ func TestParseOutLinks(t *testing.T) {
 func TestRepairContentLinks(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&types.WikiFolder{}, &types.WikiPage{}, &types.WikiPageRevision{}))
+	require.NoError(t, db.AutoMigrate(&types.WikiFolder{}, &types.WikiPage{}, &types.WikiPageRevision{}, &types.WikiSourceRefIndex{}, &types.EvidenceNodeLink{}, &types.CitationProfileEvent{}, &types.CitationProfileScope{}, &types.CitationProfileEventOutbox{}))
 
 	ctx := context.Background()
 	repo := repository.NewWikiPageRepository(db)
@@ -609,7 +879,7 @@ func TestComputeGraphSubset_EgoRejectsMissingCenter(t *testing.T) {
 func TestFindPagesByNormalizedTitleMatchesWhitespace(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&types.WikiFolder{}, &types.WikiPage{}, &types.WikiPageRevision{}))
+	require.NoError(t, db.AutoMigrate(&types.WikiFolder{}, &types.WikiPage{}, &types.WikiPageRevision{}, &types.WikiSourceRefIndex{}, &types.EvidenceNodeLink{}, &types.CitationProfileEvent{}, &types.CitationProfileScope{}, &types.CitationProfileEventOutbox{}))
 
 	ctx := context.Background()
 	repo := repository.NewWikiPageRepository(db)

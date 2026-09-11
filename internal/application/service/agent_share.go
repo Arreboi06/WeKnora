@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/agent/tools"
@@ -500,41 +501,58 @@ func (s *agentShareService) GetSharedAgentForTenant(
 	return agent, nil
 }
 
-// TenantCanAccessKBViaSomeSharedAgent returns true if the caller's tenant has
-// at least one shared agent that can access the given KB (used when opening KB
-// detail from "通过智能体可见" list without agent_id).
-func (s *agentShareService) TenantCanAccessKBViaSomeSharedAgent(ctx context.Context, tenantID uint64, callerTenantRole types.TenantRole, kb *types.KnowledgeBase) (bool, error) {
+// ResolveSharedAgentForKB returns the exact shared agent authorizing a KB when
+// a caller opens a "通过智能体可见" entry without an explicit agent_id. When
+// more than one grant applies, the lexicographically smallest non-empty agent
+// ID is selected so every node persists the same durable ACL identity.
+func (s *agentShareService) ResolveSharedAgentForKB(ctx context.Context, tenantID uint64, callerTenantRole types.TenantRole, kb *types.KnowledgeBase) (*types.CustomAgent, error) {
 	if kb == nil || kb.ID == "" {
-		return false, nil
+		return nil, nil
 	}
 	list, err := s.ListSharedAgents(ctx, tenantID, callerTenantRole)
 	if err != nil || len(list) == 0 {
-		return false, err
+		return nil, err
 	}
+	return selectSharedAgentForKB(list, kb), nil
+}
+
+// TenantCanAccessKBViaSomeSharedAgent is the compatibility form used by
+// handlers that need only a one-shot authorization decision. It delegates to
+// the identity-bearing resolver so both paths apply identical eligibility and
+// deterministic selection rules.
+func (s *agentShareService) TenantCanAccessKBViaSomeSharedAgent(ctx context.Context, tenantID uint64, callerTenantRole types.TenantRole, kb *types.KnowledgeBase) (bool, error) {
+	agent, err := s.ResolveSharedAgentForKB(ctx, tenantID, callerTenantRole, kb)
+	return agent != nil, err
+}
+
+func selectSharedAgentForKB(list []*types.SharedAgentInfo, kb *types.KnowledgeBase) *types.CustomAgent {
+	if kb == nil || strings.TrimSpace(kb.ID) == "" {
+		return nil
+	}
+	var selected *types.CustomAgent
 	for _, info := range list {
 		if info.Agent == nil {
 			continue
 		}
 		agent := info.Agent
-		if agent.TenantID != kb.TenantID {
+		if strings.TrimSpace(agent.ID) == "" || agent.TenantID != kb.TenantID {
 			continue
 		}
 		mode := agent.Config.KBSelectionMode
-		if mode == "none" {
-			continue
-		}
-		if mode == "all" {
-			return true, nil
-		}
+		eligible := mode == "all"
 		if mode == "selected" {
 			for _, id := range agent.Config.KnowledgeBases {
 				if id == kb.ID {
-					return true, nil
+					eligible = true
+					break
 				}
 			}
 		}
+		if eligible && (selected == nil || agent.ID < selected.ID) {
+			selected = agent
+		}
 	}
-	return false, nil
+	return selected
 }
 
 // GetShare gets an agent share by ID

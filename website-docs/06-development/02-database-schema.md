@@ -233,7 +233,7 @@ erDiagram
 
 - `AUTO_MIGRATE != "false"` 时（**默认开启**），调用 `database.RunMigrationsWithOptions(migrateDSN, opts)`；
 - `AUTO_RECOVER_DIRTY != "false"` 时（**默认开启**）设置 `MigrationOptions.AutoRecoverDirty = true`，遇到 dirty state 自动尝试恢复；
-- 迁移失败**只打 Warn 日志不阻断启动**（假设迁移可能由外部管理），排查问题时务必看启动日志；
+- 迁移失败或迁移结束后仍为 dirty 时会返回错误并**阻断应用启动**，避免在未知 schema 上继续提供服务；
 - postgres 的 migrate DSN 会拼上 `options=-c app.skip_embedding=<true|false>`（取决于 `RETRIEVE_DRIVER` 是否包含 `postgres`），控制 `embeddings` 相关迁移是否实际建表建索引。
 
 `internal/database/migration.go` 中的路径选择逻辑：
@@ -298,7 +298,7 @@ make migrate-up
 
 ### 7.2 迁移"成功"但表没建出来
 
-检查启动日志：自动迁移失败只是 Warn（`Database migration failed ... Continuing with application startup`），不会让进程退出。另外 `embeddings` 相关对象受 `app.skip_embedding` 门控——若 `RETRIEVE_DRIVER` 不含 `postgres`，不建 `embeddings` 索引属预期行为。
+检查启动日志：自动迁移失败或最终 dirty 会记录 `Database migration failed` 并使启动失败，修复数据库后再重启。另外 `embeddings` 相关对象受 `app.skip_embedding` 门控——若 `RETRIEVE_DRIVER` 不含 `postgres`，不建 `embeddings` 索引属预期行为。
 
 ### 7.3 密码特殊字符导致连接失败
 

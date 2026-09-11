@@ -247,8 +247,15 @@ func (c *StringArray) Scan(value interface{}) error {
 	if value == nil {
 		return nil
 	}
-	b, ok := value.([]byte)
-	if !ok {
+	var b []byte
+	switch typed := value.(type) {
+	case []byte:
+		b = typed
+	case string:
+		// SQLite returns TEXT produced by JSON functions as string even when
+		// ordinary Valuer inserts of the same column come back as []byte.
+		b = []byte(typed)
+	default:
 		return nil
 	}
 	return json.Unmarshal(b, c)

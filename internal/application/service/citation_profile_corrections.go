@@ -81,13 +81,17 @@ func citationProfileCorrectionResponse(correction *types.CitationProfileCorrecti
 	if correction == nil {
 		return nil
 	}
+	eventCutoff, correctionCutoff, activeRunPointerCutoff := types.CitationProfileSnapshotCutoffs(correction.ResultingReadVersion, correction.CreatedAt)
 	return &types.CitationProfileCorrectionResponse{
 		CorrectionID: correction.ID,
 		Action:       correction.CorrectionType,
 		Snapshot: &types.CitationProfileSnapshot{
-			SubjectEpoch: correction.SubjectEpoch,
-			ReadVersion:  strconv.FormatUint(correction.ResultingReadVersion, 10),
-			CapturedAt:   time.Now().UTC().Format(time.RFC3339Nano),
+			SubjectEpoch:           correction.SubjectEpoch,
+			ReadVersion:            strconv.FormatUint(correction.ResultingReadVersion, 10),
+			EventCutoff:            eventCutoff,
+			CorrectionCutoff:       correctionCutoff,
+			ActiveRunPointerCutoff: activeRunPointerCutoff,
+			CapturedAt:             correction.CreatedAt.UTC().Format(time.RFC3339Nano),
 		},
 		Result: "applied",
 	}

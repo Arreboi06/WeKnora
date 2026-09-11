@@ -1,8 +1,10 @@
 package types
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -30,7 +32,83 @@ const (
 	CitationProfileACLStateUnknown = "unknown"
 	CitationProfileACLStateError   = "error"
 	CitationProfileACLStateTimeout = "timeout"
+	CitationProfileACLStateDenied  = "denied"
+
+	CitationProfileACLAccessPathOwner      = "owner"
+	CitationProfileACLAccessPathKBShare    = "kb_share"
+	CitationProfileACLAccessPathAgentShare = "agent_share"
+	CitationProfileFenceReasonACLDenied    = "acl_denied"
 )
+
+type CitationProfileACLDecision string
+
+const (
+	CitationProfileACLDecisionAllow   CitationProfileACLDecision = "allow"
+	CitationProfileACLDecisionDeny    CitationProfileACLDecision = "deny"
+	CitationProfileACLDecisionUnknown CitationProfileACLDecision = "unknown"
+	CitationProfileACLDecisionError   CitationProfileACLDecision = "error"
+	CitationProfileACLDecisionTimeout CitationProfileACLDecision = "timeout"
+)
+
+// CitationProfileACLAuthorityResult carries both the authority decision and
+// the earliest known instant at which an ALLOW can no longer be trusted. The
+// refresh runner must never cache ALLOW beyond ValidUntil. A nil ValidUntil
+// means the authority did not observe a time-bounded grant; it does not relax
+// the runner's normal short refresh TTL.
+type CitationProfileACLAuthorityResult struct {
+	Decision   CitationProfileACLDecision
+	ValidUntil *time.Time
+}
+
+// CitationProfileACLBinding is derived by the KB access guard. It is not part
+// of any public request DTO and therefore cannot be supplied by a client.
+type CitationProfileACLBinding struct {
+	PrincipalType         string
+	PrincipalID           string
+	AuthenticatedTenantID uint64
+	APIKeyID              uint64
+	AccessPath            string
+	AccessPathID          string
+}
+
+func (b CitationProfileACLBinding) Normalize() CitationProfileACLBinding {
+	b.PrincipalType = strings.TrimSpace(b.PrincipalType)
+	b.PrincipalID = strings.TrimSpace(b.PrincipalID)
+	b.AccessPath = strings.TrimSpace(b.AccessPath)
+	b.AccessPathID = strings.TrimSpace(b.AccessPathID)
+	return b
+}
+
+func (b CitationProfileACLBinding) Valid() bool {
+	b = b.Normalize()
+	if b.PrincipalType == "" || b.PrincipalID == "" || b.AuthenticatedTenantID == 0 {
+		return false
+	}
+	switch b.AccessPath {
+	case CitationProfileACLAccessPathOwner:
+		return b.AccessPathID == ""
+	case CitationProfileACLAccessPathKBShare, CitationProfileACLAccessPathAgentShare:
+		return b.AccessPathID != ""
+	default:
+		return false
+	}
+}
+
+func WithCitationProfileACLBinding(ctx context.Context, binding CitationProfileACLBinding) context.Context {
+	if ctx == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, CitationProfileACLBindingContextKey, binding.Normalize())
+}
+
+func CitationProfileACLBindingFromContext(ctx context.Context) (CitationProfileACLBinding, bool) {
+	if ctx == nil {
+		return CitationProfileACLBinding{}, false
+	}
+	binding, ok := ctx.Value(CitationProfileACLBindingContextKey).(CitationProfileACLBinding)
+	binding = binding.Normalize()
+	return binding, ok && binding.Valid()
+}
 
 const (
 	CitationProfileEventStatusPendingResolution = "pending_resolution"
@@ -42,6 +120,18 @@ const (
 	CitationProfileOutboxStatusDelivering = "delivering"
 	CitationProfileOutboxStatusDelivered  = "delivered"
 	CitationProfileOutboxStatusDeadletter = "deadletter"
+
+	CitationProfileOutboxErrorExpired          = "outbox_expired"
+	CitationProfileOutboxErrorMaxAttempts      = "max_attempts"
+	CitationProfileOutboxErrorScopeDeleted     = "scope_deleted"
+	CitationProfileOutboxErrorResolutionFailed = "resolution_failed"
+	CitationProfileOutboxErrorLeaseLost        = "lease_lost"
+
+	CitationProfileOutboxMessageExpired          = "resolution work expired"
+	CitationProfileOutboxMessageMaxAttempts      = "resolution retry budget exhausted"
+	CitationProfileOutboxMessageScopeDeleted     = "scope is no longer active"
+	CitationProfileOutboxMessageResolutionFailed = "resolution attempt failed"
+	CitationProfileOutboxMessageLeaseLost        = "outbox lease is no longer owned"
 
 	EvidenceRelationCurrent    = "evidenced_current"
 	EvidenceRelationHistorical = "evidenced_historical"
@@ -68,11 +158,12 @@ const (
 	CitationProfileExportFormatJSON    = "json"
 	CitationProfileExportSchemaVersion = "citation_profile_export_v1"
 
-	CitationProfileReceiptHiddenPurgeScheduled = "profile_hidden_purge_scheduled"
-	CitationProfileReceiptAccepted             = "request_accepted"
+	CitationProfileReceiptHiddenAndFenced = "profile_hidden_and_fenced"
+	CitationProfileReceiptAccepted        = "request_accepted"
 
 	CitationProfileCursorEndpointNodes    = "nodes"
 	CitationProfileCursorEndpointEvidence = "node_evidence"
+	CitationProfileCursorSortIDAsc        = "id_asc"
 
 	CitationProfileCorrectionStateNone           = "none"
 	CitationProfileCorrectionStateConfirmed      = "confirmed"
@@ -91,11 +182,55 @@ var (
 	ErrCitationProfileQuotaExceeded       = errors.New("citation profile quota exceeded")
 	ErrCitationProfileNotFound            = errors.New("citation profile not found")
 	ErrCitationProfileDeleted             = errors.New("citation profile deleted")
+	ErrCitationProfileOutboxLeaseLost     = errors.New("citation profile outbox lease lost")
+	ErrCitationProfileOutboxExpired       = errors.New("citation profile outbox expired")
+	ErrCitationProfileOutboxMaxAttempts   = errors.New("citation profile outbox max attempts")
+	ErrCitationProfileCommitted           = errors.New("citation profile committed")
+	ErrCitationProfileACLLeaseLost        = errors.New("citation profile ACL lease lost")
 )
+
+// CitationProfilePostCommitError reports a resolver/notification failure
+// after the authoritative message and event transaction has already committed.
+// Callers must continue the normal message workflow and let durable outbox
+// recovery finish the asynchronous part.
+type CitationProfilePostCommitError struct {
+	Cause error
+}
+
+func (e *CitationProfilePostCommitError) Error() string {
+	return ErrCitationProfileCommitted.Error() + "; evidence resolution queued"
+}
+
+func (e *CitationProfilePostCommitError) Unwrap() error {
+	if e == nil {
+		return ErrCitationProfileCommitted
+	}
+	return e.Cause
+}
+
+func (e *CitationProfilePostCommitError) Is(target error) bool {
+	return target == ErrCitationProfileCommitted
+}
 
 // CitationProfileConfig controls the Topic 4 profile feature. The zero value is off.
 type CitationProfileConfig struct {
 	Enabled bool `yaml:"enabled" json:"enabled" mapstructure:"enabled"`
+}
+
+// CitationProfileACLRuntimeState is the single database-coordinated safety
+// marker. Its enabled bit is monotonic during normal application startup: the
+// first enabled rollout performs one global fence, and locally disabled peers
+// continue honoring that marker on permission writes.
+type CitationProfileACLRuntimeState struct {
+	ID                   uint8     `gorm:"primaryKey;autoIncrement:false" json:"-"`
+	Enabled              bool      `gorm:"not null" json:"-"`
+	TransitionGeneration uint64    `gorm:"not null" json:"-"`
+	ChangedAt            time.Time `gorm:"not null" json:"-"`
+	UpdatedAt            time.Time `gorm:"not null" json:"-"`
+}
+
+func (CitationProfileACLRuntimeState) TableName() string {
+	return "citation_profile_acl_runtime_state"
 }
 
 // CitationProfileGuidance is fixed for P36/P30: the backend exposes evidence only.
@@ -152,30 +287,65 @@ func CitationProfileDefaultLimits() CitationProfileLimits {
 }
 
 type CitationProfileScope struct {
-	ID                      string     `json:"-" gorm:"type:varchar(36);primaryKey"`
-	TenantID                uint64     `json:"-" gorm:"not null;index"`
-	SubjectID               string     `json:"-" gorm:"type:varchar(512);not null;index"`
-	KnowledgeBaseID         string     `json:"knowledge_base_id" gorm:"type:varchar(36);not null;index"`
-	SubjectEpoch            string     `json:"subject_epoch" gorm:"type:varchar(36);not null"`
-	ProfileReadVersion      uint64     `json:"-" gorm:"not null;default:0"`
-	ProfilePolicyVersion    string     `json:"profile_policy_version" gorm:"type:varchar(64);not null;default:'profile_policy_v1'"`
-	RetentionPolicyVersion  string     `json:"retention_policy_version" gorm:"type:varchar(64);not null;default:'retention_policy_v1'"`
-	Enabled                 bool       `json:"-" gorm:"not null;default:true"`
-	ActiveRunID             string     `json:"-" gorm:"type:varchar(36)"`
-	MappingRevision         uint64     `json:"-" gorm:"not null;default:0"`
-	SourceUniverseWatermark string     `json:"-" gorm:"type:varchar(128);not null;default:''"`
-	PendingEventCount       int        `json:"-" gorm:"not null;default:0"`
-	PendingMappingCount     int        `json:"-" gorm:"not null;default:0"`
-	DirtyMappingCount       int        `json:"-" gorm:"not null;default:0"`
-	ACLCheckState           string     `json:"-" gorm:"type:varchar(32);not null;default:'current'"`
-	NextACLCheckAt          *time.Time `json:"-"`
-	ACLCheckLeaseUntil      *time.Time `json:"-"`
-	FencedAt                *time.Time `json:"-" gorm:"index"`
-	FenceReason             string     `json:"-" gorm:"type:varchar(64);not null;default:''"`
-	DeleteRequestID         string     `json:"-" gorm:"type:varchar(36)"`
-	DeletedAt               *time.Time `json:"-" gorm:"index"`
-	CreatedAt               time.Time  `json:"-"`
-	UpdatedAt               time.Time  `json:"-"`
+	ID                       string     `json:"-" gorm:"type:varchar(36);primaryKey"`
+	TenantID                 uint64     `json:"-" gorm:"not null;index"`
+	SubjectID                string     `json:"-" gorm:"type:varchar(512);not null;index"`
+	KnowledgeBaseID          string     `json:"knowledge_base_id" gorm:"type:varchar(36);not null;index"`
+	SubjectEpoch             string     `json:"subject_epoch" gorm:"type:varchar(36);not null"`
+	ProfileReadVersion       uint64     `json:"-" gorm:"not null;default:0"`
+	ProfilePolicyVersion     string     `json:"profile_policy_version" gorm:"type:varchar(64);not null;default:'profile_policy_v1'"`
+	RetentionPolicyVersion   string     `json:"retention_policy_version" gorm:"type:varchar(64);not null;default:'retention_policy_v1'"`
+	Enabled                  bool       `json:"-" gorm:"not null;default:true"`
+	ActiveRunID              string     `json:"-" gorm:"type:varchar(36)"`
+	MappingRevision          uint64     `json:"-" gorm:"not null;default:0"`
+	SourceUniverseWatermark  string     `json:"-" gorm:"type:varchar(128);not null;default:''"`
+	PendingEventCount        int        `json:"-" gorm:"not null;default:0"`
+	PendingMappingCount      int        `json:"-" gorm:"not null;default:0"`
+	DirtyMappingCount        int        `json:"-" gorm:"not null;default:0"`
+	ACLCheckState            string     `json:"-" gorm:"type:varchar(32);not null;default:'unknown'"`
+	NextACLCheckAt           *time.Time `json:"-"`
+	ACLCheckLeaseUntil       *time.Time `json:"-"`
+	ACLCheckLeaseToken       string     `json:"-" gorm:"type:varchar(128);not null;default:''"`
+	ACLCheckedAt             *time.Time `json:"-"`
+	ACLPrincipalType         string     `json:"-" gorm:"type:varchar(32);not null;default:''"`
+	ACLPrincipalID           string     `json:"-" gorm:"type:varchar(512);not null;default:''"`
+	ACLAuthenticatedTenantID uint64     `json:"-" gorm:"not null;default:0"`
+	ACLAPIKeyID              uint64     `json:"-" gorm:"not null;default:0"`
+	ACLAccessPath            string     `json:"-" gorm:"type:varchar(32);not null;default:''"`
+	ACLAccessPathID          string     `json:"-" gorm:"type:varchar(128);not null;default:''"`
+	ACLGeneration            uint64     `json:"-" gorm:"not null;default:0"`
+	FencedAt                 *time.Time `json:"-" gorm:"index"`
+	FenceReason              string     `json:"-" gorm:"type:varchar(64);not null;default:''"`
+	DeleteRequestID          string     `json:"-" gorm:"type:varchar(36)"`
+	DeletedAt                *time.Time `json:"-" gorm:"index"`
+	CreatedAt                time.Time  `json:"-"`
+	UpdatedAt                time.Time  `json:"-"`
+	ACLCurrent               bool       `json:"-" gorm:"->;-:migration"`
+}
+
+// CitationProfileACLClaim is the immutable authority-check lease returned by
+// the ACL queue. Apply must compare both LeaseToken and Generation before a
+// result can change the scope.
+type CitationProfileACLClaim struct {
+	ScopeID    string
+	LeaseToken string
+	Generation uint64
+	Scope      CitationProfileScope
+}
+
+// CitationProfileACLMutation identifies an authoritative grant mutation. Every
+// non-zero field is matched with AND semantics; zero-value fields are
+// wildcards. An entirely empty mutation is rejected so a caller cannot
+// accidentally suspend every profile scope.
+type CitationProfileACLMutation struct {
+	PrincipalType         string
+	PrincipalID           string
+	AuthenticatedTenantID uint64
+	APIKeyID              uint64
+	SourceTenantID        uint64
+	KnowledgeBaseID       string
+	AccessPath            string
+	AccessPathID          string
 }
 
 func (CitationProfileScope) TableName() string {
@@ -191,15 +361,82 @@ func (s *CitationProfileScope) Suspended() bool {
 		!s.Enabled ||
 		s.FencedAt != nil ||
 		s.DeletedAt != nil ||
-		citationProfileACLState(s.ACLCheckState) != CitationProfileACLStateCurrent
+		!s.ACLCurrentAt(time.Now().UTC())
 }
 
-func citationProfileACLState(state string) string {
-	state = strings.TrimSpace(state)
-	if state == "" {
-		return CitationProfileACLStateCurrent
+// ACLAuthorityBindingValid reports whether the persisted server-derived
+// authority identity is complete and internally consistent. A CURRENT state
+// without this binding is legacy or corrupt data and must never be readable.
+func (s *CitationProfileScope) ACLAuthorityBindingValid() bool {
+	if s == nil || s.TenantID == 0 || strings.TrimSpace(s.KnowledgeBaseID) == "" ||
+		strings.TrimSpace(s.ACLPrincipalID) == "" || s.ACLAuthenticatedTenantID == 0 {
+		return false
 	}
-	return state
+	switch strings.TrimSpace(s.ACLPrincipalType) {
+	case PrincipalWebUser:
+		if s.ACLAPIKeyID != 0 {
+			return false
+		}
+	case PrincipalAPITenant, PrincipalAPIExternalUser:
+		if s.ACLAPIKeyID == 0 {
+			return false
+		}
+	default:
+		return false
+	}
+	switch strings.TrimSpace(s.ACLAccessPath) {
+	case CitationProfileACLAccessPathOwner:
+		return strings.TrimSpace(s.ACLAccessPathID) == "" && s.ACLAuthenticatedTenantID == s.TenantID
+	case CitationProfileACLAccessPathKBShare:
+		return strings.TrimSpace(s.ACLAccessPathID) == strings.TrimSpace(s.KnowledgeBaseID)
+	case CitationProfileACLAccessPathAgentShare:
+		return strings.TrimSpace(s.ACLAccessPathID) != ""
+	default:
+		return false
+	}
+}
+
+// ACLCurrentAt is the single in-memory fail-closed gate for citation-profile
+// surfaces. CURRENT is meaningful only while the server-derived authority
+// proof is complete, has actually been checked, has no in-flight lease, and
+// has not expired.
+func (s *CitationProfileScope) ACLCurrentAt(now time.Time) bool {
+	if s == nil || strings.TrimSpace(s.ACLCheckState) != CitationProfileACLStateCurrent ||
+		!s.ACLAuthorityBindingValid() || s.ACLCheckedAt == nil || s.NextACLCheckAt == nil ||
+		strings.TrimSpace(s.ACLCheckLeaseToken) != "" || s.ACLCheckLeaseUntil != nil || s.ACLGeneration == 0 {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	checkedAt := s.ACLCheckedAt.UTC()
+	nextCheckAt := s.NextACLCheckAt.UTC()
+	return !checkedAt.After(now) && nextCheckAt.After(now) && nextCheckAt.After(checkedAt)
+}
+
+// CitationProfileSnapshotCutoffs returns the three typed opaque cutoffs that
+// bind the event, correction, and active-run projections to one profile
+// version. The timestamp is informational; the version is the consistency
+// boundary used by cursor validation.
+func CitationProfileSnapshotCutoffs(readVersion uint64, stateAt time.Time) (string, string, string) {
+	versionToken := "rv:" + strconv.FormatUint(readVersion, 10)
+	if !stateAt.IsZero() {
+		versionToken += ";at:" + stateAt.UTC().Format(time.RFC3339Nano)
+	}
+	return "event:" + versionToken, "correction:" + versionToken, "active_run:" + versionToken
+}
+
+func CitationProfileScopeSnapshotCutoffs(scope *CitationProfileScope) (string, string, string) {
+	if scope == nil {
+		return CitationProfileSnapshotCutoffs(0, time.Time{})
+	}
+	stateAt := scope.UpdatedAt
+	if stateAt.IsZero() {
+		stateAt = scope.CreatedAt
+	}
+	return CitationProfileSnapshotCutoffs(scope.ProfileReadVersion, stateAt)
 }
 
 type CitationProfileScopeDTO struct {
@@ -308,6 +545,13 @@ type CitationProfileCursor struct {
 	ActiveRunPointerCutoff       string `json:"active_run_pointer_cutoff,omitempty"`
 	CurrentIndexWatermark        string `json:"current_index_watermark,omitempty"`
 	CurrentWikiUniverseWatermark string `json:"current_wiki_universe_watermark,omitempty"`
+	MappingRevision              string `json:"mapping_revision,omitempty"`
+	SourceUniverseWatermark      string `json:"source_universe_watermark,omitempty"`
+	DirtyEventCount              int    `json:"dirty_event_count,omitempty"`
+	PendingEventCount            int    `json:"pending_event_count,omitempty"`
+	PendingMappingCount          int    `json:"pending_mapping_count,omitempty"`
+	DirtyMappingCount            int    `json:"dirty_mapping_count,omitempty"`
+	CapturedAt                   string `json:"captured_at,omitempty"`
 	PageSize                     int    `json:"page_size"`
 	Sort                         string `json:"sort"`
 	LastPageUUID                 string `json:"last_page_uuid,omitempty"`
@@ -460,24 +704,27 @@ func (CitationProfileEvent) TableName() string {
 }
 
 type CitationProfileEventOutbox struct {
-	ID               string     `json:"id" gorm:"type:varchar(36);primaryKey"`
-	TenantID         uint64     `json:"-" gorm:"not null;index"`
-	SubjectID        string     `json:"-" gorm:"type:varchar(512);not null;index"`
-	KnowledgeBaseID  string     `json:"knowledge_base_id" gorm:"type:varchar(36);not null;index"`
-	SubjectEpoch     string     `json:"subject_epoch" gorm:"type:varchar(36);not null;index"`
-	ScopeID          string     `json:"scope_id" gorm:"type:varchar(36);not null;index"`
-	EventID          string     `json:"event_id" gorm:"type:varchar(36);not null;index"`
-	Status           string     `json:"status" gorm:"type:varchar(32);not null;default:'pending'"`
-	AttemptCount     int        `json:"attempt_count" gorm:"not null;default:0"`
-	NextAttemptAt    time.Time  `json:"next_attempt_at"`
-	LockedAt         *time.Time `json:"locked_at,omitempty"`
-	LockedBy         string     `json:"locked_by" gorm:"type:varchar(128);not null;default:''"`
-	DeliveredAt      *time.Time `json:"delivered_at,omitempty"`
-	DeadletterAt     *time.Time `json:"deadletter_at,omitempty"`
-	LastErrorCode    string     `json:"last_error_code" gorm:"type:varchar(64);not null;default:''"`
-	LastErrorMessage string     `json:"last_error_message" gorm:"type:text;not null;default:''"`
-	CreatedAt        time.Time  `json:"created_at"`
-	UpdatedAt        time.Time  `json:"updated_at"`
+	ID                       string     `json:"id" gorm:"type:varchar(36);primaryKey"`
+	TenantID                 uint64     `json:"-" gorm:"not null;index"`
+	SubjectID                string     `json:"-" gorm:"type:varchar(512);not null;index"`
+	KnowledgeBaseID          string     `json:"knowledge_base_id" gorm:"type:varchar(36);not null;index"`
+	SubjectEpoch             string     `json:"subject_epoch" gorm:"type:varchar(36);not null;index"`
+	ScopeID                  string     `json:"scope_id" gorm:"type:varchar(36);not null;index"`
+	EventID                  string     `json:"event_id" gorm:"type:varchar(36);not null;index"`
+	Status                   string     `json:"status" gorm:"type:varchar(32);not null;default:'pending'"`
+	AttemptCount             int        `json:"attempt_count" gorm:"not null;default:0"`
+	NextAttemptAt            time.Time  `json:"next_attempt_at"`
+	LockedAt                 *time.Time `json:"locked_at,omitempty"`
+	LeaseUntil               *time.Time `json:"lease_until,omitempty"`
+	LockedBy                 string     `json:"locked_by" gorm:"type:varchar(128);not null;default:''"`
+	DeliveredAt              *time.Time `json:"delivered_at,omitempty"`
+	DeadletterAt             *time.Time `json:"deadletter_at,omitempty"`
+	LastErrorCode            string     `json:"last_error_code" gorm:"type:varchar(64);not null;default:''"`
+	LastErrorMessage         string     `json:"last_error_message" gorm:"type:text;not null;default:''"`
+	RetryBudgetPausedAt      *time.Time `json:"-"`
+	RetryBudgetPausedSeconds int64      `json:"-" gorm:"not null;default:0"`
+	CreatedAt                time.Time  `json:"created_at"`
+	UpdatedAt                time.Time  `json:"updated_at"`
 }
 
 func (CitationProfileEventOutbox) TableName() string {
@@ -486,16 +733,16 @@ func (CitationProfileEventOutbox) TableName() string {
 
 type WikiSourceRefIndex struct {
 	ID                string    `json:"id" gorm:"type:varchar(36);primaryKey"`
-	TenantID          uint64    `json:"tenant_id" gorm:"not null;index"`
-	KnowledgeBaseID   string    `json:"knowledge_base_id" gorm:"type:varchar(36);not null;index"`
-	SourceKnowledgeID string    `json:"source_knowledge_id" gorm:"type:varchar(36);not null;index"`
-	PageUUID          string    `json:"page_uuid" gorm:"type:varchar(36);not null;index"`
-	PageVersion       int       `json:"page_version" gorm:"not null"`
+	TenantID          uint64    `json:"tenant_id" gorm:"not null;index;uniqueIndex:uq_wiki_source_ref_index_version,priority:1"`
+	KnowledgeBaseID   string    `json:"knowledge_base_id" gorm:"type:varchar(36);not null;index;uniqueIndex:uq_wiki_source_ref_index_version,priority:2"`
+	SourceKnowledgeID string    `json:"source_knowledge_id" gorm:"type:varchar(36);not null;index;uniqueIndex:uq_wiki_source_ref_index_version,priority:3"`
+	PageUUID          string    `json:"page_uuid" gorm:"type:varchar(36);not null;index;uniqueIndex:uq_wiki_source_ref_index_version,priority:4"`
+	PageVersion       int       `json:"page_version" gorm:"not null;uniqueIndex:uq_wiki_source_ref_index_version,priority:5"`
 	PageSlug          string    `json:"page_slug" gorm:"type:varchar(255);not null;default:''"`
 	PageTitle         string    `json:"page_title" gorm:"type:varchar(512);not null;default:''"`
-	NormalizedRef     string    `json:"normalized_ref" gorm:"type:varchar(512);not null"`
-	MappingRevision   uint64    `json:"mapping_revision" gorm:"not null"`
-	LifecycleState    string    `json:"lifecycle_state" gorm:"type:varchar(32);not null;default:'current'"`
+	NormalizedRef     string    `json:"normalized_ref" gorm:"type:varchar(512);not null;uniqueIndex:uq_wiki_source_ref_index_version,priority:6"`
+	MappingRevision   uint64    `json:"mapping_revision" gorm:"not null;uniqueIndex:uq_wiki_source_ref_index_version,priority:7"`
+	LifecycleState    string    `json:"lifecycle_state" gorm:"type:varchar(32);not null;default:'current';uniqueIndex:uq_wiki_source_ref_index_version,priority:8"`
 	IndexWatermark    string    `json:"index_watermark" gorm:"type:varchar(128);not null;default:''"`
 	IndexedAt         time.Time `json:"indexed_at"`
 	CreatedAt         time.Time `json:"created_at"`

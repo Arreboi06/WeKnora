@@ -38,8 +38,14 @@ func (r *citationProfileRepository) ApplyCorrection(
 	if tenantID == 0 || subjectID == "" || kbID == "" || idempotencyKey == "" || action == "" || eventID == "" || pageUUID == "" {
 		return nil, fmt.Errorf("%w: correction requires scope, action, event, page and idempotency", types.ErrCitationProfileInvalidRequest)
 	}
+	switch action {
+	case types.CitationCorrectionConfirmRelevant, types.CitationCorrectionRejectMapping, types.CitationCorrectionRetractEvent:
+	default:
+		return nil, fmt.Errorf("%w: unsupported correction action", types.ErrCitationProfileInvalidRequest)
+	}
 
 	var applied *types.CitationProfileCorrection
+	var verifiedScope *types.CitationProfileScope
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		scope, err := r.loadLiveCitationScopeForUpdate(tx, tenantID, subjectID, kbID)
 		if err != nil {
@@ -51,15 +57,20 @@ func (r *citationProfileRepository) ApplyCorrection(
 		if scope.FencedAt != nil {
 			return types.ErrCitationProfileDeleted
 		}
-		if !citationProfileScopeACLCurrent(scope) {
-			return types.ErrCitationProfileUnavailable
+		if err := r.ensureCitationProfileACLCurrentTx(tx, scope); err != nil {
+			return err
 		}
 		if existing, found, err := r.findCitationProfileCorrectionByIdem(
 			tx, tenantID, subjectID, kbID, scope.SubjectEpoch, idempotencyKey, expectedReadVersion, action, eventID, pageUUID, reasonCode,
 		); err != nil {
 			return err
 		} else if found {
+			if err := r.ensureCitationProfileACLCurrentTx(tx, scope); err != nil {
+				return err
+			}
 			applied = existing
+			scopeSnapshot := *scope
+			verifiedScope = &scopeSnapshot
 			return nil
 		}
 		if scope.ProfileReadVersion != expectedReadVersion {
@@ -70,15 +81,18 @@ func (r *citationProfileRepository) ApplyCorrection(
 		if err != nil {
 			return err
 		}
-		if event.RetractedAt != nil && action != types.CitationCorrectionRetractEvent {
+		if event.RetractedAt != nil {
 			return types.ErrCitationProfileDeleted
 		}
-		link, err := r.loadCitationCorrectionLinkForUpdate(tx, scope, eventID, pageUUID)
+		link, err := r.loadCitationCorrectionLinkForUpdate(tx, scope, event, pageUUID)
 		if err != nil {
 			return err
 		}
 
-		now := time.Now().UTC()
+		now, err := citationProfileDatabaseNow(tx)
+		if err != nil {
+			return err
+		}
 		nextVersion := scope.ProfileReadVersion + 1
 		if err := r.applyCitationCorrectionMutation(tx, scope, event, link, action, now); err != nil {
 			return err
@@ -117,10 +131,41 @@ func (r *citationProfileRepository) ApplyCorrection(
 		if result.RowsAffected == 0 {
 			return types.ErrCitationProfileChanged
 		}
-		applied = correction
+		if err := r.ensureCitationProfileACLCurrentTx(tx, scope); err != nil {
+			return err
+		}
+		var current types.CitationProfileScope
+		if err := tx.Where(
+			"id = ? AND tenant_id = ? AND subject_id = ? AND knowledge_base_id = ? AND subject_epoch = ?",
+			scope.ID, scope.TenantID, scope.SubjectID, scope.KnowledgeBaseID, scope.SubjectEpoch,
+		).First(&current).Error; err != nil {
+			return err
+		}
+		if err := r.ensureCitationProfileACLCurrentTx(tx, &current); err != nil {
+			return err
+		}
+		// Return the database's persisted representation, not the pre-insert Go
+		// value. PostgreSQL stores timestamptz at microsecond precision, so using
+		// the in-memory nanoseconds for the first response would make an otherwise
+		// identical idempotent replay produce different snapshot cutoffs.
+		var persisted types.CitationProfileCorrection
+		if err := tx.Where(
+			"id = ? AND tenant_id = ? AND subject_id = ? AND knowledge_base_id = ? AND subject_epoch = ? AND scope_id = ?",
+			correction.ID, scope.TenantID, scope.SubjectID, scope.KnowledgeBaseID, scope.SubjectEpoch, scope.ID,
+		).First(&persisted).Error; err != nil {
+			return err
+		}
+		verifiedScope = &current
+		applied = &persisted
 		return nil
 	})
-	return applied, err
+	if err != nil {
+		return nil, err
+	}
+	if err := r.verifyCitationProfileReadSnapshotFresh(ctx, verifiedScope); err != nil {
+		return nil, err
+	}
+	return applied, nil
 }
 
 func (r *citationProfileRepository) findCitationProfileCorrectionByIdem(
@@ -177,16 +222,20 @@ func (r *citationProfileRepository) loadCitationCorrectionEvent(tx *gorm.DB, sco
 	return &event, nil
 }
 
-func (r *citationProfileRepository) loadCitationCorrectionLinkForUpdate(tx *gorm.DB, scope *types.CitationProfileScope, eventID string, pageUUID string) (*types.EvidenceNodeLink, error) {
+func (r *citationProfileRepository) loadCitationCorrectionLinkForUpdate(tx *gorm.DB, scope *types.CitationProfileScope, event *types.CitationProfileEvent, pageUUID string) (*types.EvidenceNodeLink, error) {
+	if event == nil || strings.TrimSpace(event.ActiveRunID) == "" {
+		return nil, types.ErrCitationProfileNotFound
+	}
 	var link types.EvidenceNodeLink
 	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
-		"tenant_id = ? AND subject_id = ? AND knowledge_base_id = ? AND subject_epoch = ? AND scope_id = ? AND event_id = ? AND page_uuid = ?",
+		"tenant_id = ? AND subject_id = ? AND knowledge_base_id = ? AND subject_epoch = ? AND scope_id = ? AND event_id = ? AND resolution_run_id = ? AND page_uuid = ?",
 		scope.TenantID,
 		scope.SubjectID,
 		scope.KnowledgeBaseID,
 		scope.SubjectEpoch,
 		scope.ID,
-		eventID,
+		event.ID,
+		event.ActiveRunID,
 		pageUUID,
 	).First(&link).Error
 	if err != nil {
@@ -201,25 +250,52 @@ func (r *citationProfileRepository) loadCitationCorrectionLinkForUpdate(tx *gorm
 func (r *citationProfileRepository) applyCitationCorrectionMutation(tx *gorm.DB, scope *types.CitationProfileScope, event *types.CitationProfileEvent, link *types.EvidenceNodeLink, action string, now time.Time) error {
 	switch action {
 	case types.CitationCorrectionConfirmRelevant:
-		return tx.Model(&types.EvidenceNodeLink{}).
-			Where("id = ? AND tenant_id = ? AND subject_id = ? AND scope_id = ?", link.ID, scope.TenantID, scope.SubjectID, scope.ID).
-			Update("relation_state", types.EvidenceRelationCurrent).Error
+		result := tx.Model(&types.EvidenceNodeLink{}).
+			Where("id = ? AND tenant_id = ? AND subject_id = ? AND knowledge_base_id = ? AND subject_epoch = ? AND scope_id = ? AND event_id = ? AND page_uuid = ?",
+				link.ID, scope.TenantID, scope.SubjectID, scope.KnowledgeBaseID, scope.SubjectEpoch, scope.ID, event.ID, link.PageUUID).
+			Update("relation_state", types.EvidenceRelationCurrent)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return types.ErrCitationProfileChanged
+		}
+		return nil
 	case types.CitationCorrectionRejectMapping:
-		return tx.Model(&types.EvidenceNodeLink{}).
-			Where("id = ? AND tenant_id = ? AND subject_id = ? AND scope_id = ?", link.ID, scope.TenantID, scope.SubjectID, scope.ID).
-			Update("relation_state", types.EvidenceRelationDisputed).Error
+		result := tx.Model(&types.EvidenceNodeLink{}).
+			Where("id = ? AND tenant_id = ? AND subject_id = ? AND knowledge_base_id = ? AND subject_epoch = ? AND scope_id = ? AND event_id = ? AND page_uuid = ?",
+				link.ID, scope.TenantID, scope.SubjectID, scope.KnowledgeBaseID, scope.SubjectEpoch, scope.ID, event.ID, link.PageUUID).
+			Update("relation_state", types.EvidenceRelationDisputed)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return types.ErrCitationProfileChanged
+		}
+		return nil
 	case types.CitationCorrectionRetractEvent:
 		if event.RetractedAt == nil {
-			if err := tx.Model(&types.CitationProfileEvent{}).
+			result := tx.Model(&types.CitationProfileEvent{}).
 				Where("id = ? AND tenant_id = ? AND subject_id = ? AND scope_id = ? AND retracted_at IS NULL", event.ID, scope.TenantID, scope.SubjectID, scope.ID).
-				Update("retracted_at", now).Error; err != nil {
-				return err
+				Updates(map[string]interface{}{"retracted_at": now, "updated_at": now})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return types.ErrCitationProfileChanged
 			}
 		}
-		return tx.Model(&types.EvidenceNodeLink{}).
+		result := tx.Model(&types.EvidenceNodeLink{}).
 			Where("tenant_id = ? AND subject_id = ? AND knowledge_base_id = ? AND subject_epoch = ? AND scope_id = ? AND event_id = ?",
 				scope.TenantID, scope.SubjectID, scope.KnowledgeBaseID, scope.SubjectEpoch, scope.ID, event.ID).
-			Update("relation_state", types.EvidenceRelationDisputed).Error
+			Update("relation_state", types.EvidenceRelationDisputed)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return types.ErrCitationProfileChanged
+		}
+		return nil
 	default:
 		return fmt.Errorf("%w: unsupported correction action", types.ErrCitationProfileInvalidRequest)
 	}

@@ -99,6 +99,11 @@ func setupWikiPagesTestDB(t *testing.T) *gorm.DB {
 	require.NoError(t, err)
 	require.NoError(t, db.Exec(wikiPagesTestDDL).Error)
 	require.NoError(t, db.Exec(wikiFoldersTestDDL).Error)
+	require.NoError(t, db.AutoMigrate(
+		&types.WikiSourceRefIndex{},
+		&types.EvidenceNodeLink{},
+		&types.CitationProfileScope{},
+	))
 	for _, stmt := range strings.Split(strings.TrimSpace(wikiPageRevisionsTestDDL), ";") {
 		if strings.TrimSpace(stmt) == "" {
 			continue
@@ -106,6 +111,69 @@ func setupWikiPagesTestDB(t *testing.T) *gorm.DB {
 		require.NoError(t, db.Exec(stmt).Error)
 	}
 	return db
+}
+
+// The Topic 4 feature is default-off. Ordinary Wiki persistence therefore
+// must remain usable against the pre-Topic-4 schema and must not probe any of
+// the Citation Profile tables when no feature configuration is supplied.
+func TestWikiPageRepositoryDefaultOffDoesNotTouchCitationProfileSchema(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.Exec(wikiPagesTestDDL).Error)
+
+	repo := NewWikiPageRepository(db)
+	ctx := context.Background()
+	page := makeWikiPage("kb-default-off", "doc/default-off", types.WikiPageTypeConcept, types.WikiPageStatusPublished)
+	page.SourceRefs = types.StringArray{"knowledge-default-off|Source"}
+	require.NoError(t, repo.Create(ctx, page))
+
+	page.Title = "user edit"
+	require.NoError(t, repo.Update(ctx, page))
+
+	page.Content = "machine decoration [[doc/target]]"
+	page.OutLinks = types.StringArray{"doc/target"}
+	require.NoError(t, repo.UpdateAutoLinkedContent(ctx, page))
+
+	page.SourceRefs = types.StringArray{"knowledge-default-off-updated|Source"}
+	require.NoError(t, repo.UpdateMeta(ctx, page))
+	require.NoError(t, repo.UpdateInLink(ctx, page.TenantID, page.KnowledgeBaseID, page.Slug, "doc/source", true))
+	var withBacklink types.WikiPage
+	require.NoError(t, db.First(&withBacklink, "id = ?", page.ID).Error)
+	require.Equal(t, types.StringArray{"doc/source"}, withBacklink.InLinks)
+	require.NoError(t, repo.Delete(ctx, page.KnowledgeBaseID, page.Slug))
+}
+
+func TestWikiPageRepositoryUpdatedAtTokenRejectsSameVersionLostUpdates(t *testing.T) {
+	db := setupWikiPagesTestDB(t)
+	repo := NewWikiPageRepository(db)
+	ctx := context.Background()
+	page := makeWikiPage("kb-meta-token", "doc/meta-token", types.WikiPageTypeConcept, types.WikiPageStatusPublished)
+	page.SourceRefs = types.StringArray{"source-original|Source"}
+	require.NoError(t, repo.Create(ctx, page))
+
+	writerA := *page
+	writerB := *page
+	staleAutoDecorator := *page
+	writerA.SourceRefs = types.StringArray{"source-writer-a|Source"}
+	require.NoError(t, repo.UpdateMeta(ctx, &writerA))
+	require.True(t, writerA.UpdatedAt.After(page.UpdatedAt), "successful metadata writes must advance the CAS token")
+
+	writerB.ParentSlug = "doc/parent-from-stale-writer"
+	require.ErrorIs(t, repo.UpdateMeta(ctx, &writerB), ErrWikiPageConflict,
+		"two bookkeeping writers from one Wiki generation must not overwrite one another")
+	writerB.Title = "stale user edit"
+	require.ErrorIs(t, repo.Update(ctx, &writerB), ErrWikiPageConflict,
+		"a user write loaded before metadata committed must reload and merge")
+	staleAutoDecorator.Content = "stale automatic rewrite"
+	require.ErrorIs(t, repo.UpdateAutoLinkedContent(ctx, &staleAutoDecorator), ErrWikiPageConflict,
+		"an automatic decorator loaded before metadata committed must not publish stale content")
+
+	var stored types.WikiPage
+	require.NoError(t, db.First(&stored, "id = ?", page.ID).Error)
+	require.Equal(t, types.StringArray{"source-writer-a|Source"}, stored.SourceRefs)
+	require.Empty(t, stored.ParentSlug)
+	require.Equal(t, page.Title, stored.Title)
+	require.Equal(t, page.Content, stored.Content)
 }
 
 // makeWikiPage builds a minimal WikiPage suitable for insert. Title is
@@ -514,6 +582,26 @@ func TestUpdateWithRevisionRollsBackSnapshotOnVersionConflict(t *testing.T) {
 	assert.Equal(t, 1, stale.Version, "a rejected write must not leave a bumped version behind")
 	assert.Zero(t, countWikiRevisions(t, db, page.ID),
 		"the snapshot must roll back with the failed update, or history would list a still-current version")
+}
+
+func TestUpdateRestoresVersionWhenSourceRefSyncRollsBack(t *testing.T) {
+	db := setupWikiPagesTestDB(t)
+	repo := NewWikiPageRepository(db, &types.CitationProfileConfig{Enabled: true})
+	ctx := context.Background()
+
+	page := makeWikiPage("kb-sync-rollback", "concept/sync-rollback", types.WikiPageTypeConcept, types.WikiPageStatusPublished)
+	require.NoError(t, repo.Create(ctx, page))
+	require.NoError(t, db.Migrator().DropTable(&types.WikiSourceRefIndex{}))
+
+	page.Content = "must roll back"
+	err := repo.Update(ctx, page)
+
+	require.Error(t, err)
+	assert.Equal(t, 1, page.Version, "a rolled-back source-ref sync must restore the caller's expected version")
+	var persisted types.WikiPage
+	require.NoError(t, db.First(&persisted, "id = ?", page.ID).Error)
+	assert.Equal(t, 1, persisted.Version)
+	assert.NotEqual(t, page.Content, persisted.Content)
 }
 
 func TestUpdateWithRevisionIgnoresDuplicateSnapshot(t *testing.T) {

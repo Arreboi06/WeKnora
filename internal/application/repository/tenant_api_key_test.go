@@ -16,9 +16,10 @@ func TestTenantAPIKeyRepositoryPersistsUTCExpiry(t *testing.T) {
 
 	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&types.TenantAPIKey{}))
+	require.NoError(t, db.AutoMigrate(&types.TenantAPIKey{}, &types.CitationProfileScope{}))
+	seedCitationProfileACLRuntimeStateForRepositoryTest(t, db)
 
-	repo := NewTenantAPIKeyRepository(db)
+	repo := NewTenantAPIKeyRepository(db, nil)
 	ctx := context.Background()
 
 	expiresAt := time.Unix(time.Now().UTC().Add(5*time.Second).Unix(), 0).UTC()
@@ -46,8 +47,9 @@ func TestTenantAPIKeyRepositoryPersistsUTCExpiry(t *testing.T) {
 func TestTenantAPIKeyRepositoryUpdateIsTenantScoped(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&types.TenantAPIKey{}))
-	repo := NewTenantAPIKeyRepository(db)
+	require.NoError(t, db.AutoMigrate(&types.TenantAPIKey{}, &types.CitationProfileScope{}))
+	seedCitationProfileACLRuntimeStateForRepositoryTest(t, db)
+	repo := NewTenantAPIKeyRepository(db, nil)
 	ctx := context.Background()
 	tenant42, tenant43 := uint64(42), uint64(43)
 	keys := []*types.TenantAPIKey{

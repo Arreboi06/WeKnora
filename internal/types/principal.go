@@ -182,7 +182,7 @@ func SessionOwnerIDFromContext(ctx context.Context) string {
 			return p.StorageID()
 		case PrincipalAPITenant:
 			if scope, ok := TenantAPIKeyScopeFromContext(ctx); ok && scope.KeyID > 0 {
-				if tenantID, ok := TenantIDFromContext(ctx); ok && tenantID > 0 {
+				if tenantID, ok := AuthenticatedTenantIDFromContext(ctx); ok && tenantID > 0 {
 					return fmt.Sprintf("%s%d:%d", SessionOwnerAPITenantKeyPrefix, tenantID, scope.KeyID)
 				}
 			}

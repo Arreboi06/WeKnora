@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -58,6 +60,7 @@ type spyCitationProfileScopeStore struct {
 	lastReasonCode string
 
 	correctionResp *types.CitationProfileCorrection
+	completionErr  error
 }
 
 func (s *spyCitationProfileScopeStore) GetScopeStatus(
@@ -180,11 +183,17 @@ func (s *spyCitationProfileScopeStore) SetEnrollment(
 func (s *spyCitationProfileScopeStore) CompleteAssistantMessageWithEvents(
 	context.Context, uint64, string, *types.Message,
 ) (int, error) {
-	return 0, nil
+	return 0, s.completionErr
 }
 
 func (s *spyCitationProfileScopeStore) ResolveEvidenceEvent(
 	context.Context, uint64, string, string,
+) (*types.EvidenceResolutionRun, error) {
+	return nil, nil
+}
+
+func (s *spyCitationProfileScopeStore) ResolveClaimedEvidenceEvent(
+	context.Context, *types.CitationProfileEventOutbox,
 ) (*types.EvidenceResolutionRun, error) {
 	return nil, nil
 }
@@ -303,6 +312,7 @@ func TestCitationProfileStatusUsesServerSubjectAndSnapshot(t *testing.T) {
 			ProfilePolicyVersion:    types.CitationProfilePolicyVersion,
 			RetentionPolicyVersion:  types.CitationProfileRetentionPolicyVersion,
 			Enabled:                 true,
+			ACLCurrent:              true,
 			UpdatedAt:               time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC),
 		},
 	}
@@ -320,6 +330,9 @@ func TestCitationProfileStatusUsesServerSubjectAndSnapshot(t *testing.T) {
 	require.Equal(t, "kb-a", got.Scope.KnowledgeBaseID)
 	require.Equal(t, "22f90680-c3c4-4b13-85fb-36ec61b7b95c", got.Snapshot.SubjectEpoch)
 	require.Equal(t, "12", got.Snapshot.ReadVersion)
+	require.Equal(t, "event:rv:12;at:2026-09-02T12:00:00Z", got.Snapshot.EventCutoff)
+	require.Equal(t, "correction:rv:12;at:2026-09-02T12:00:00Z", got.Snapshot.CorrectionCutoff)
+	require.Equal(t, "active_run:rv:12;at:2026-09-02T12:00:00Z", got.Snapshot.ActiveRunPointerCutoff)
 	require.Equal(t, "5", got.Snapshot.MappingRevision)
 	require.Equal(t, "wiki-watermark-5", got.Snapshot.SourceUniverseWatermark)
 	require.Equal(t, "wiki-watermark-5", got.Snapshot.CurrentWikiUniverseWatermark)
@@ -339,13 +352,16 @@ func TestCitationProfileListNodesUsesServerSubjectAndCursor(t *testing.T) {
 		Endpoint:        types.CitationProfileCursorEndpointNodes,
 		KnowledgeBaseID: "kb-a",
 		PageSize:        50,
+		Sort:            types.CitationProfileCursorSortIDAsc,
 		LastPageUUID:    "page-a",
 	})
 	require.NoError(t, err)
 	store := &spyCitationProfileScopeStore{}
 	svc := NewCitationProfileService(&types.CitationProfileConfig{Enabled: true}, store)
+	cursorToken, err := citationProfileSignCursorToken(base64.RawURLEncoding.EncodeToString(cursorPayload))
+	require.NoError(t, err)
 
-	got, err := svc.ListNodes(citationProfileTestContext(), " kb-a ", base64.RawURLEncoding.EncodeToString(cursorPayload), 50)
+	got, err := svc.ListNodes(citationProfileTestContext(), " kb-a ", cursorToken, 50)
 
 	require.NoError(t, err)
 	require.Equal(t, 1, store.listNodeCalls)
@@ -357,6 +373,115 @@ func TestCitationProfileListNodesUsesServerSubjectAndCursor(t *testing.T) {
 	require.Equal(t, 50, store.lastPageSize)
 	require.Equal(t, 50, got.PageSize)
 }
+
+func TestCitationProfileCursorRejectsUnsignedTokenBeforeRepository(t *testing.T) {
+	cursorPayload, err := json.Marshal(types.CitationProfileCursor{
+		SchemaVersion:   types.CitationProfileCursorSchemaV1,
+		Endpoint:        types.CitationProfileCursorEndpointNodes,
+		KnowledgeBaseID: "kb-a",
+		PageSize:        50,
+		Sort:            types.CitationProfileCursorSortIDAsc,
+		LastPageUUID:    "page-a",
+	})
+	require.NoError(t, err)
+	store := &spyCitationProfileScopeStore{}
+	svc := NewCitationProfileService(&types.CitationProfileConfig{Enabled: true}, store)
+
+	_, err = svc.ListNodes(
+		citationProfileTestContext(),
+		"kb-a",
+		base64.RawURLEncoding.EncodeToString(cursorPayload),
+		50,
+	)
+
+	require.ErrorIs(t, err, types.ErrCitationProfileInvalidRequest)
+	require.Zero(t, store.listNodeCalls)
+
+	signed, err := citationProfileSignCursorToken(base64.RawURLEncoding.EncodeToString(cursorPayload))
+	require.NoError(t, err)
+	parts := strings.Split(signed, ".")
+	require.Len(t, parts, 2)
+	parts[0] = parts[0][:len(parts[0])-1] + "A"
+	_, err = svc.ListNodes(citationProfileTestContext(), "kb-a", strings.Join(parts, "."), 50)
+	require.ErrorIs(t, err, types.ErrCitationProfileInvalidRequest)
+	require.Zero(t, store.listNodeCalls)
+}
+
+func TestCitationProfileCursorSignsRepositoryNextCursor(t *testing.T) {
+	cursorPayload, err := json.Marshal(types.CitationProfileCursor{
+		SchemaVersion:   types.CitationProfileCursorSchemaV1,
+		Endpoint:        types.CitationProfileCursorEndpointNodes,
+		KnowledgeBaseID: "kb-a",
+		PageSize:        50,
+		Sort:            types.CitationProfileCursorSortIDAsc,
+		LastPageUUID:    "page-a",
+	})
+	require.NoError(t, err)
+	unsigned := base64.RawURLEncoding.EncodeToString(cursorPayload)
+	store := &spyCitationProfileScopeStore{
+		listNodeResp: &types.CitationProfileNodeListResponse{
+			PageSize:   50,
+			NextCursor: &unsigned,
+			Guidance:   types.CitationProfileDefaultGuidance(),
+		},
+	}
+	svc := NewCitationProfileService(&types.CitationProfileConfig{Enabled: true}, store)
+
+	got, err := svc.ListNodes(citationProfileTestContext(), "kb-a", "", 50)
+	require.NoError(t, err)
+	require.NotNil(t, got.NextCursor)
+	require.Len(t, strings.Split(*got.NextCursor, "."), 2)
+	require.NotEqual(t, unsigned, *got.NextCursor)
+}
+
+func TestCitationProfileEvidenceSignsRepositoryNextCursor(t *testing.T) {
+	cursorPayload, err := json.Marshal(types.CitationProfileCursor{
+		SchemaVersion:   types.CitationProfileCursorSchemaV1,
+		Endpoint:        types.CitationProfileCursorEndpointEvidence,
+		KnowledgeBaseID: "kb-a",
+		PageSize:        50,
+		Sort:            types.CitationProfileCursorSortIDAsc,
+		LastPageUUID:    "page-a",
+		LastRelationID:  "relation-a",
+	})
+	require.NoError(t, err)
+	unsigned := base64.RawURLEncoding.EncodeToString(cursorPayload)
+	store := &spyCitationProfileScopeStore{
+		evidenceResp: &types.CitationProfileNodeEvidenceResponse{
+			NextCursor: &unsigned,
+			Guidance:   types.CitationProfileDefaultGuidance(),
+		},
+	}
+	svc := NewCitationProfileService(&types.CitationProfileConfig{Enabled: true}, store)
+
+	got, err := svc.ListNodeEvidence(citationProfileTestContext(), "kb-a", "page-a", "", 50)
+	require.NoError(t, err)
+	require.NotNil(t, got.NextCursor)
+	require.Len(t, strings.Split(*got.NextCursor, "."), 2)
+	require.NotEqual(t, unsigned, *got.NextCursor)
+
+	decoded, err := citationProfileDecodeCursor(
+		*got.NextCursor,
+		types.CitationProfileCursorEndpointEvidence,
+		"kb-a",
+		50,
+	)
+	require.NoError(t, err)
+	require.Equal(t, "page-a", decoded.LastPageUUID)
+	require.Equal(t, "relation-a", decoded.LastRelationID)
+}
+
+func TestCitationProfileCursorRejectsOversizedTokenBeforeRepository(t *testing.T) {
+	store := &spyCitationProfileScopeStore{}
+	svc := NewCitationProfileService(&types.CitationProfileConfig{Enabled: true}, store)
+	oversized := strings.Repeat("a", citationProfileCursorMaxPayloadLength+base64.RawURLEncoding.EncodedLen(len(citationProfileCursorSignature("")))+2)
+
+	_, err := svc.ListNodes(citationProfileTestContext(), "kb-a", oversized, 50)
+
+	require.ErrorIs(t, err, types.ErrCitationProfileInvalidRequest)
+	require.Zero(t, store.listNodeCalls)
+}
+
 func TestCitationProfileEnrollmentUsesServerSubjectAndGuard(t *testing.T) {
 	expected := uint64(16)
 	idem := "11111111-1111-4111-8111-111111111111"
@@ -371,6 +496,7 @@ func TestCitationProfileEnrollmentUsesServerSubjectAndGuard(t *testing.T) {
 			ProfilePolicyVersion:   types.CitationProfilePolicyVersion,
 			RetentionPolicyVersion: types.CitationProfileRetentionPolicyVersion,
 			Enabled:                true,
+			ACLCheckState:          types.CitationProfileACLStateCurrent,
 		},
 	}
 	svc := NewCitationProfileService(&types.CitationProfileConfig{Enabled: true}, store)
@@ -390,6 +516,45 @@ func TestCitationProfileEnrollmentUsesServerSubjectAndGuard(t *testing.T) {
 	require.Equal(t, &expected, store.lastExpected)
 	require.Equal(t, idem, store.lastIdem)
 	require.Equal(t, "17", got.Snapshot.ReadVersion)
+	require.NotEmpty(t, got.Snapshot.EventCutoff)
+	require.NotEmpty(t, got.Snapshot.CorrectionCutoff)
+	require.NotEmpty(t, got.Snapshot.ActiveRunPointerCutoff)
+}
+
+func TestCitationProfileEnrollmentRedactsNonCurrentScopeState(t *testing.T) {
+	for _, aclState := range []string{
+		types.CitationProfileACLStateUnknown,
+		types.CitationProfileACLStateDenied,
+	} {
+		t.Run(aclState, func(t *testing.T) {
+			store := &spyCitationProfileScopeStore{
+				enrollmentScope: &types.CitationProfileScope{
+					ID:                     "scope-secret",
+					TenantID:               7,
+					SubjectID:              "user-7",
+					KnowledgeBaseID:        "kb-a",
+					SubjectEpoch:           "epoch-secret",
+					ProfileReadVersion:     91,
+					ProfilePolicyVersion:   types.CitationProfilePolicyVersion,
+					RetentionPolicyVersion: types.CitationProfileRetentionPolicyVersion,
+					Enabled:                true,
+					ACLCheckState:          aclState,
+				},
+			}
+			svc := NewCitationProfileService(&types.CitationProfileConfig{Enabled: true}, store)
+
+			got, err := svc.SetEnrollment(citationProfileTestContext(), "kb-a", types.CitationProfileEnrollmentRequest{
+				Enabled:        true,
+				IdempotencyKey: "11111111-1111-4111-8111-111111111111",
+			})
+
+			require.NoError(t, err)
+			require.True(t, got.Enabled)
+			require.True(t, got.Enrolled)
+			require.Nil(t, got.Scope)
+			require.Nil(t, got.Snapshot)
+		})
+	}
 }
 
 func TestCitationProfileCorrectionUsesServerSubjectAndCanonicalIDs(t *testing.T) {
@@ -430,6 +595,29 @@ func TestCitationProfileCorrectionUsesServerSubjectAndCanonicalIDs(t *testing.T)
 	})
 	require.ErrorIs(t, err, types.ErrCitationProfileInvalidRequest)
 }
+
+func TestCitationProfileCorrectionResponseIsStableForIdempotentReplay(t *testing.T) {
+	createdAt := time.Date(2026, 9, 11, 10, 54, 0, 123456000, time.UTC)
+	correction := &types.CitationProfileCorrection{
+		ID:                   "correction-stable-replay",
+		SubjectEpoch:         "epoch-stable-replay",
+		CorrectionType:       types.CitationCorrectionRejectMapping,
+		ResultingReadVersion: 19,
+		CreatedAt:            createdAt,
+	}
+
+	first := citationProfileCorrectionResponse(correction)
+	second := citationProfileCorrectionResponse(correction)
+
+	firstJSON, err := json.Marshal(first)
+	require.NoError(t, err)
+	secondJSON, err := json.Marshal(second)
+	require.NoError(t, err)
+	require.Equal(t, createdAt.Format(time.RFC3339Nano), first.Snapshot.CapturedAt,
+		"a replayable response must be derived from the persisted correction clock")
+	require.Equal(t, firstJSON, secondJSON, "an exact idempotent replay must return the original response")
+}
+
 func TestCitationProfileExportRequiresGuardAndBuildsDownloadURL(t *testing.T) {
 	store := &spyCitationProfileScopeStore{}
 	svc := NewCitationProfileService(&types.CitationProfileConfig{Enabled: true}, store)
@@ -450,18 +638,42 @@ func TestCitationProfileExportRequiresGuardAndBuildsDownloadURL(t *testing.T) {
 	require.Equal(t, "7", got.Snapshot.ReadVersion)
 }
 
-func TestCitationProfileBlindDeleteFeatureOffStillRequiresSubjectButDoesNotReadStore(t *testing.T) {
+func TestCitationProfileDeleteFeatureOffStillPersistsFenceAndReceipt(t *testing.T) {
 	store := &spyCitationProfileScopeStore{}
 	svc := NewCitationProfileService(&types.CitationProfileConfig{Enabled: false}, store)
 
 	_, err := svc.RequestBlindDelete(context.Background(), "kb-a")
 	require.ErrorIs(t, err, types.ErrCitationProfileAuthRequired)
 
+	current, err := svc.RequestCurrentACLDelete(citationProfileTestContext(), "kb-a", types.CitationProfileDeleteRequest{
+		ExpectedReadVersion: "7",
+		IdempotencyKey:      "33333333-3333-4333-8333-333333333333",
+	})
+	require.NoError(t, err)
+	require.Equal(t, types.CitationProfileOperationStatusAccepted, current.Status)
+	require.Equal(t, types.CitationProfileReceiptHiddenAndFenced, current.ReceiptCode)
+	require.Equal(t, 1, store.currentDeletes,
+		"feature-off must never acknowledge a current-ACL delete without persisting its fence")
+
 	got, err := svc.RequestBlindDelete(citationProfileTestContext(), "kb-a")
 	require.NoError(t, err)
 	require.Equal(t, types.CitationProfileOperationStatusAccepted, got.Status)
 	require.Equal(t, types.CitationProfileReceiptAccepted, got.ReceiptCode)
-	require.Equal(t, 0, store.blindDeleteCalls)
+	require.Equal(t, 1, store.blindDeleteCalls,
+		"the account deletion right remains durable while the display feature is off")
+}
+
+func TestCitationProfileCompletionPreservesPostCommitMarker(t *testing.T) {
+	store := &spyCitationProfileScopeStore{
+		completionErr: &types.CitationProfilePostCommitError{Cause: errors.New("resolver temporarily unavailable secret=do-not-log")},
+	}
+	svc := NewCitationProfileService(&types.CitationProfileConfig{Enabled: true}, store)
+	message := &types.Message{ID: "message-a", KnowledgeReferences: []*types.SearchResult{{KnowledgeID: "knowledge-a"}}}
+
+	handled, err := svc.CompleteAssistantMessage(citationProfileTestContext(), message)
+	require.True(t, handled)
+	require.ErrorIs(t, err, types.ErrCitationProfileCommitted)
+	require.NotContains(t, err.Error(), "do-not-log")
 }
 
 func citationProfileTestContext() context.Context {

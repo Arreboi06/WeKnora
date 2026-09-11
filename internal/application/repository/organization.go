@@ -8,6 +8,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var (
@@ -25,12 +26,13 @@ var (
 // the (org, tenant) tuple; the underlying table is
 // organization_tenant_members.
 type organizationRepository struct {
-	db *gorm.DB
+	db                 *gorm.DB
+	citationProfileACL citationProfileACLInvalidationGate
 }
 
 // NewOrganizationRepository creates a new organization repository
-func NewOrganizationRepository(db *gorm.DB) interfaces.OrganizationRepository {
-	return &organizationRepository{db: db}
+func NewOrganizationRepository(db *gorm.DB, citationProfileConfig *types.CitationProfileConfig) interfaces.OrganizationRepository {
+	return &organizationRepository{db: db, citationProfileACL: newCitationProfileACLInvalidationGate(citationProfileConfig)}
 }
 
 // Create creates a new organization
@@ -109,7 +111,32 @@ func (r *organizationRepository) Update(ctx context.Context, org *types.Organiza
 
 // Delete soft deletes an organization
 func (r *organizationRepository) Delete(ctx context.Context, id string) error {
-	return r.db.WithContext(ctx).Where("id = ?", id).Delete(&types.Organization{}).Error
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var members []types.OrganizationTenantMember
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("organization_id = ?", id).
+			Order("tenant_id ASC").Order("id ASC").
+			Find(&members).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("id = ?", id).Delete(&types.Organization{}).Error; err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		mutations := make([]types.CitationProfileACLMutation, 0, len(members)*2)
+		var lastTenantID uint64
+		for i := range members {
+			if i > 0 && members[i].TenantID == lastTenantID {
+				continue
+			}
+			mutations = append(mutations, citationProfileSharedACLMutationsForTenant(members[i].TenantID)...)
+			lastTenantID = members[i].TenantID
+		}
+		if len(mutations) == 0 {
+			return nil
+		}
+		return r.citationProfileACL.invalidateMany(tx, mutations, now)
+	})
 }
 
 // AddTenantMember inserts a new (org, tenant) membership row. Returns
@@ -117,47 +144,67 @@ func (r *organizationRepository) Delete(ctx context.Context, id string) error {
 // service layer treats that as a no-op when the caller is just confirming
 // an idempotent join.
 func (r *organizationRepository) AddTenantMember(ctx context.Context, member *types.OrganizationTenantMember) error {
-	var count int64
-	r.db.WithContext(ctx).Model(&types.OrganizationTenantMember{}).
-		Where("organization_id = ? AND tenant_id = ?", member.OrganizationID, member.TenantID).
-		Count(&count)
-
-	if count > 0 {
-		return ErrOrgMemberAlreadyExists
-	}
-
-	return r.db.WithContext(ctx).Create(member).Error
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var count int64
+		if err := tx.Model(&types.OrganizationTenantMember{}).
+			Where("organization_id = ? AND tenant_id = ?", member.OrganizationID, member.TenantID).
+			Count(&count).Error; err != nil {
+			return err
+		}
+		if count > 0 {
+			return ErrOrgMemberAlreadyExists
+		}
+		if err := tx.Create(member).Error; err != nil {
+			return err
+		}
+		return r.citationProfileACL.invalidateMany(tx, citationProfileSharedACLMutationsForTenant(member.TenantID), time.Now().UTC())
+	})
 }
 
 // RemoveTenantMember removes the (org, tenant) membership row.
 func (r *organizationRepository) RemoveTenantMember(ctx context.Context, orgID string, tenantID uint64) error {
-	result := r.db.WithContext(ctx).
-		Where("organization_id = ? AND tenant_id = ?", orgID, tenantID).
-		Delete(&types.OrganizationTenantMember{})
-
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		return ErrOrgMemberNotFound
-	}
-	return nil
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Where("organization_id = ? AND tenant_id = ?", orgID, tenantID).
+			Delete(&types.OrganizationTenantMember{})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return ErrOrgMemberNotFound
+		}
+		return r.citationProfileACL.invalidateMany(tx, citationProfileSharedACLMutationsForTenant(tenantID), time.Now().UTC())
+	})
 }
 
 // UpdateTenantMemberRole updates the role for a (org, tenant) membership.
 func (r *organizationRepository) UpdateTenantMemberRole(ctx context.Context, orgID string, tenantID uint64, role types.OrgMemberRole) error {
-	result := r.db.WithContext(ctx).
-		Model(&types.OrganizationTenantMember{}).
-		Where("organization_id = ? AND tenant_id = ?", orgID, tenantID).
-		Update("role", role)
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&types.OrganizationTenantMember{}).
+			Where("organization_id = ? AND tenant_id = ?", orgID, tenantID).
+			Update("role", role)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return ErrOrgMemberNotFound
+		}
+		return r.citationProfileACL.invalidateMany(tx, citationProfileSharedACLMutationsForTenant(tenantID), time.Now().UTC())
+	})
+}
 
-	if result.Error != nil {
-		return result.Error
+func invalidateCitationProfileSharedACLForTenantTx(tx *gorm.DB, tenantID uint64, now time.Time) error {
+	return invalidateCitationProfileACLMutationsTx(tx, citationProfileSharedACLMutationsForTenant(tenantID), now)
+}
+
+func citationProfileSharedACLMutationsForTenant(tenantID uint64) []types.CitationProfileACLMutation {
+	mutations := make([]types.CitationProfileACLMutation, 0, 2)
+	for _, accessPath := range []string{types.CitationProfileACLAccessPathAgentShare, types.CitationProfileACLAccessPathKBShare} {
+		mutations = append(mutations, types.CitationProfileACLMutation{
+			AuthenticatedTenantID: tenantID,
+			AccessPath:            accessPath,
+		})
 	}
-	if result.RowsAffected == 0 {
-		return ErrOrgMemberNotFound
-	}
-	return nil
+	return mutations
 }
 
 // ListTenantMembers lists all tenant memberships for an organization.

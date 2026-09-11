@@ -18,7 +18,7 @@ func TestUserRepositoryTenantlessCreateAndUpdateKeepNullTenantID(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 
-	repo := NewUserRepository(db)
+	repo := NewUserRepository(db, nil)
 	user := &types.User{
 		ID:           "tenantless-user",
 		Username:     "before-update",

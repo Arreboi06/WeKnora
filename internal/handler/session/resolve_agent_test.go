@@ -53,6 +53,9 @@ func (s *resolveAgentShareStub) SetSharedAgentDisabledByMe(context.Context, uint
 func (s *resolveAgentShareStub) TenantCanAccessKBViaSomeSharedAgent(context.Context, uint64, types.TenantRole, *types.KnowledgeBase) (bool, error) {
 	panic("not implemented")
 }
+func (s *resolveAgentShareStub) ResolveSharedAgentForKB(context.Context, uint64, types.TenantRole, *types.KnowledgeBase) (*types.CustomAgent, error) {
+	panic("not implemented")
+}
 func (s *resolveAgentShareStub) GetShare(context.Context, string) (*types.AgentShare, error) {
 	panic("not implemented")
 }

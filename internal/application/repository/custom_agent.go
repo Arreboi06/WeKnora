@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -14,12 +15,13 @@ var ErrCustomAgentNotFound = errors.New("custom agent not found")
 
 // customAgentRepository implements the CustomAgentRepository interface
 type customAgentRepository struct {
-	db *gorm.DB
+	db                 *gorm.DB
+	citationProfileACL citationProfileACLInvalidationGate
 }
 
 // NewCustomAgentRepository creates a new custom agent repository
-func NewCustomAgentRepository(db *gorm.DB) interfaces.CustomAgentRepository {
-	return &customAgentRepository{db: db}
+func NewCustomAgentRepository(db *gorm.DB, citationProfileConfig *types.CitationProfileConfig) interfaces.CustomAgentRepository {
+	return &customAgentRepository{db: db, citationProfileACL: newCitationProfileACLInvalidationGate(citationProfileConfig)}
 }
 
 // CreateAgent creates a new custom agent
@@ -53,12 +55,31 @@ func (r *customAgentRepository) ListAgentsByTenantID(ctx context.Context, tenant
 
 // UpdateAgent updates an agent
 func (r *customAgentRepository) UpdateAgent(ctx context.Context, agent *types.CustomAgent) error {
-	return r.db.WithContext(ctx).Save(agent).Error
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(agent).Error; err != nil {
+			return err
+		}
+		return r.citationProfileACL.invalidate(tx, types.CitationProfileACLMutation{
+			SourceTenantID: agent.TenantID,
+			AccessPath:     types.CitationProfileACLAccessPathAgentShare,
+			AccessPathID:   agent.ID,
+		}, time.Now().UTC())
+	})
 }
 
 // DeleteAgent deletes an agent (soft delete)
 func (r *customAgentRepository) DeleteAgent(ctx context.Context, id string, tenantID uint64) error {
-	return r.db.WithContext(ctx).Where("id = ? AND tenant_id = ?", id, tenantID).Delete(&types.CustomAgent{}).Error
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Where("id = ? AND tenant_id = ?", id, tenantID).Delete(&types.CustomAgent{})
+		if result.Error != nil {
+			return result.Error
+		}
+		return r.citationProfileACL.invalidate(tx, types.CitationProfileACLMutation{
+			SourceTenantID: tenantID,
+			AccessPath:     types.CitationProfileACLAccessPathAgentShare,
+			AccessPathID:   id,
+		}, time.Now().UTC())
+	})
 }
 
 // CountByModelID counts active agents whose config references modelID.

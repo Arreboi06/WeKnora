@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // switchTenantUserRepo stores users by value so UpdateUser behaves like
@@ -89,6 +91,40 @@ func TestSwitchTenantRecordsLastActiveTenantPreference(t *testing.T) {
 	}
 	if got := svc.resolveLoginTenantID(ctx, stored); got != 42 {
 		t.Fatalf("fresh login after switch resolves to %d, want 42", got)
+	}
+}
+
+func TestSwitchTenantPreservesOriginalAuthenticationTime(t *testing.T) {
+	authTime := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Second)
+	ctx := types.WithAuthTime(context.Background(), authTime)
+	repo := &switchTenantUserRepo{users: map[string]types.User{
+		"alice": {ID: "alice", TenantID: 7},
+	}}
+	memberSvc := &membershipLookupService{byTenant: map[uint64]*types.TenantMember{
+		42: {TenantID: 42, Status: types.TenantMemberStatusActive},
+	}}
+	svc := newSwitchTenantTestService(repo, memberSvc)
+	user, _ := repo.GetUserByID(ctx, "alice")
+
+	resp, err := svc.SwitchTenant(ctx, user, 42, "")
+	if err != nil {
+		t.Fatalf("SwitchTenant: %v", err)
+	}
+	for tokenKind, tokenValue := range map[string]string{
+		"access": resp.Token, "refresh": resp.RefreshToken,
+	} {
+		claims := jwt.MapClaims{}
+		if _, _, err := jwt.NewParser().ParseUnverified(tokenValue, claims); err != nil {
+			t.Fatalf("parse %s token: %v", tokenKind, err)
+		}
+		gotAuthTime, ok := testNumericDateClaim(claims, "auth_time")
+		if !ok || !gotAuthTime.Equal(authTime) {
+			t.Fatalf("%s auth_time = %v, %v; want %v", tokenKind, gotAuthTime, ok, authTime)
+		}
+		issuedAt, ok := testNumericDateClaim(claims, "iat")
+		if !ok || !issuedAt.After(authTime) {
+			t.Fatalf("%s iat = %v, %v; switch may refresh iat but must not renew auth_time", tokenKind, issuedAt, ok)
+		}
 	}
 }
 

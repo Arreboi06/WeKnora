@@ -57,10 +57,19 @@ import (
 // my_permission in the response) can pull it without re-running the
 // resolution.
 type KBAccess struct {
-	KnowledgeBase     *types.KnowledgeBase
-	EffectiveTenantID uint64
-	Permission        types.OrgMemberRole
+	KnowledgeBase         *types.KnowledgeBase
+	EffectiveTenantID     uint64
+	AuthenticatedTenantID uint64
+	Permission            types.OrgMemberRole
+	AccessPath            string
+	AccessID              string
 }
+
+const (
+	KBAccessPathOwner      = "owner"
+	KBAccessPathKBShare    = "kb_share"
+	KBAccessPathAgentShare = "agent_share"
+)
 
 // KBAccessContextKey is the gin.Context key under which a successful
 // KB access resolution is stored.
@@ -300,7 +309,22 @@ func RequireKBAccess(
 		// see the source-tenant for shared KBs (so retrieval queries
 		// hit the right embedding store) without having to know.
 		c.Set(KBAccessContextKey, access)
-		newCtx := context.WithValue(ctx, types.TenantIDContextKey, access.EffectiveTenantID)
+		newCtx := types.WithAuthenticatedTenantID(ctx, access.AuthenticatedTenantID)
+		if principal, ok := types.PrincipalFromContext(ctx); ok {
+			apiKeyID := uint64(0)
+			if apiScope, ok := types.TenantAPIKeyScopeFromContext(ctx); ok {
+				apiKeyID = apiScope.KeyID
+			}
+			newCtx = types.WithCitationProfileACLBinding(newCtx, types.CitationProfileACLBinding{
+				PrincipalType:         principal.Type,
+				PrincipalID:           principal.ID,
+				AuthenticatedTenantID: access.AuthenticatedTenantID,
+				APIKeyID:              apiKeyID,
+				AccessPath:            access.AccessPath,
+				AccessPathID:          access.AccessID,
+			})
+		}
+		newCtx = context.WithValue(newCtx, types.TenantIDContextKey, access.EffectiveTenantID)
 		c.Request = c.Request.WithContext(newCtx)
 		c.Next()
 	}
@@ -346,9 +370,11 @@ func resolveKBAccessOnce(
 	// 1. Own KB.
 	if kb.TenantID == tenantID {
 		return &KBAccess{
-			KnowledgeBase:     kb,
-			EffectiveTenantID: tenantID,
-			Permission:        types.OrgRoleAdmin,
+			KnowledgeBase:         kb,
+			EffectiveTenantID:     tenantID,
+			AuthenticatedTenantID: tenantID,
+			Permission:            types.OrgRoleAdmin,
+			AccessPath:            KBAccessPathOwner,
 		}, nil
 	}
 
@@ -363,9 +389,12 @@ func resolveKBAccessOnce(
 				logger.Infof(ctx, "[kb_access] tenant %d -> shared KB %s perm=%s source=%d",
 					tenantID, kbID, permission, source)
 				return &KBAccess{
-					KnowledgeBase:     kb,
-					EffectiveTenantID: source,
-					Permission:        permission,
+					KnowledgeBase:         kb,
+					EffectiveTenantID:     source,
+					AuthenticatedTenantID: tenantID,
+					Permission:            permission,
+					AccessPath:            KBAccessPathKBShare,
+					AccessID:              kbID,
 				}, nil
 			}
 		}
@@ -425,9 +454,12 @@ func resolveSharedAgentAccess(
 			logger.Infof(ctx, "[kb_access] tenant %d -> KB %s via shared agent %s (mode=all)",
 				tenantID, kb.ID, agentID)
 			return &KBAccess{
-				KnowledgeBase:     kb,
-				EffectiveTenantID: kb.TenantID,
-				Permission:        types.OrgRoleViewer,
+				KnowledgeBase:         kb,
+				EffectiveTenantID:     kb.TenantID,
+				AuthenticatedTenantID: tenantID,
+				Permission:            types.OrgRoleViewer,
+				AccessPath:            KBAccessPathAgentShare,
+				AccessID:              agentID,
 			}, nil
 		case "selected":
 			for _, allowedID := range agent.Config.KnowledgeBases {
@@ -435,9 +467,12 @@ func resolveSharedAgentAccess(
 					logger.Infof(ctx, "[kb_access] tenant %d -> KB %s via shared agent %s (mode=selected)",
 						tenantID, kb.ID, agentID)
 					return &KBAccess{
-						KnowledgeBase:     kb,
-						EffectiveTenantID: kb.TenantID,
-						Permission:        types.OrgRoleViewer,
+						KnowledgeBase:         kb,
+						EffectiveTenantID:     kb.TenantID,
+						AuthenticatedTenantID: tenantID,
+						Permission:            types.OrgRoleViewer,
+						AccessPath:            KBAccessPathAgentShare,
+						AccessID:              agentID,
 					}, nil
 				}
 			}
@@ -445,13 +480,19 @@ func resolveSharedAgentAccess(
 		return nil, nil
 	}
 
-	can, err := agentShareService.TenantCanAccessKBViaSomeSharedAgent(ctx, tenantID, callerTenantRole, kb)
-	if err == nil && can {
-		logger.Infof(ctx, "[kb_access] tenant %d -> KB %s via some shared agent", tenantID, kb.ID)
+	authorizingAgent, err := agentShareService.ResolveSharedAgentForKB(ctx, tenantID, callerTenantRole, kb)
+	if err != nil {
+		return nil, err
+	}
+	if authorizingAgent != nil && authorizingAgent.ID != "" {
+		logger.Infof(ctx, "[kb_access] tenant %d -> KB %s via shared agent %s", tenantID, kb.ID, authorizingAgent.ID)
 		return &KBAccess{
-			KnowledgeBase:     kb,
-			EffectiveTenantID: kb.TenantID,
-			Permission:        types.OrgRoleViewer,
+			KnowledgeBase:         kb,
+			EffectiveTenantID:     kb.TenantID,
+			AuthenticatedTenantID: tenantID,
+			Permission:            types.OrgRoleViewer,
+			AccessPath:            KBAccessPathAgentShare,
+			AccessID:              authorizingAgent.ID,
 		}, nil
 	}
 	return nil, nil

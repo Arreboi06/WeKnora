@@ -32,13 +32,15 @@ func setupModelUsageTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	db := setupKBTestDB(t)
 	require.NoError(t, db.Exec(customAgentsTestDDL).Error)
+	require.NoError(t, db.AutoMigrate(&types.CitationProfileScope{}))
+	seedCitationProfileACLRuntimeStateForRepositoryTest(t, db)
 	return db
 }
 
 func TestCountByModelID_KnowledgeBase(t *testing.T) {
 	ctx := context.Background()
 	db := setupModelUsageTestDB(t)
-	repo := NewKnowledgeBaseRepository(db)
+	repo := NewKnowledgeBaseRepository(db, nil)
 	modelID := "embed-model-1"
 
 	kb := makeKB(nil)
@@ -68,10 +70,27 @@ func TestCountByModelID_KnowledgeBase(t *testing.T) {
 	assert.Equal(t, int64(1), count)
 }
 
+func TestCitationProfileScopeGORMDefaultACLStateIsUnknown(t *testing.T) {
+	db := setupModelUsageTestDB(t)
+	require.NoError(t, db.Exec(`
+		INSERT INTO citation_profile_scopes
+			(id, tenant_id, subject_id, knowledge_base_id, subject_epoch)
+		VALUES (?, ?, ?, ?, ?)`,
+		"scope-gorm-default-f7", 1, "subject-gorm-default-f7", "kb-gorm-default-f7", "epoch-gorm-default-f7",
+	).Error)
+	var state string
+	require.NoError(t, db.Raw(
+		"SELECT acl_check_state FROM citation_profile_scopes WHERE id = ?",
+		"scope-gorm-default-f7",
+	).Scan(&state).Error)
+	require.Equal(t, types.CitationProfileACLStateUnknown, state,
+		"AutoMigrate and versioned schemas must share the same fail-closed default")
+}
+
 func TestCountByModelID_CustomAgent(t *testing.T) {
 	ctx := context.Background()
 	db := setupModelUsageTestDB(t)
-	repo := NewCustomAgentRepository(db)
+	repo := NewCustomAgentRepository(db, nil)
 	modelID := "chat-model-1"
 
 	agent := &types.CustomAgent{
@@ -115,7 +134,7 @@ func TestCountByModelID_CustomAgent(t *testing.T) {
 func TestCustomAgentSandboxConfigReferences(t *testing.T) {
 	ctx := context.Background()
 	db := setupModelUsageTestDB(t)
-	repo := NewCustomAgentRepository(db)
+	repo := NewCustomAgentRepository(db, nil)
 	configID := "sandbox-cfg-1"
 
 	require.NoError(t, db.Exec(

@@ -25,12 +25,16 @@ var contextCloneAcrossDetach = map[ContextKey]bool{
 	// principal in the same workspace, so all of this has to survive; a
 	// detached goroutine that loses its tenant reads another tenant's rows or
 	// none at all.
-	TenantIDContextKey:    true,
-	TenantInfoContextKey:  true,
-	UserContextKey:        true,
-	UserIDContextKey:      true,
-	PrincipalContextKey:   true,
-	SystemAdminContextKey: true,
+	TenantIDContextKey:              true,
+	AuthenticatedTenantIDContextKey: true,
+	// The binding is a request-path authorization grant. Enrollment consumes it
+	// synchronously; detached work must use the persisted scope and recheck it.
+	CitationProfileACLBindingContextKey: false,
+	TenantInfoContextKey:                true,
+	UserContextKey:                      true,
+	UserIDContextKey:                    true,
+	PrincipalContextKey:                 true,
+	SystemAdminContextKey:               true,
 	// TenantRoleContextKey: the caller's resolved role in the active tenant
 	// (PR 2 #1303). Must survive for the same reason as TenantIDContextKey —
 	// any handler that does `ctx := logger.CloneContext(c.Request.Context())`
@@ -40,9 +44,9 @@ var contextCloneAcrossDetach = map[ContextKey]bool{
 	// Per-API-key operation and KB scopes: a restriction, so dropping it would
 	// hand background work broader reach than the key it came from.
 	TenantAPIKeyScopeContextKey: true,
-	// AuthIssuedAt is a per-request grant used for recent-auth checks; detached
+	// AuthTime is a per-request grant used for recent-auth checks; detached
 	// background work must re-authorize rather than inherit the original recency.
-	AuthIssuedAtContextKey: false,
+	AuthTimeContextKey: false,
 
 	// Session scope. SessionTenantID re-scopes session/message lookups, while
 	// SandboxTenantID keys the session→sandbox binding to the session owner

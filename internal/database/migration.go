@@ -242,16 +242,18 @@ func RunMigrationsWithOptions(dsn string, opts MigrationOptions) error {
 		return captureMigrationFailure(m, fmt.Errorf("failed to get migration version: %w", err))
 	}
 
-	setMigrationState(version, dirty, "", true)
+	if dirty {
+		return captureMigrationFailure(m, fmt.Errorf(
+			"database migration completed in dirty state at version %d", version,
+		))
+	}
+
+	setMigrationState(version, false, "", true)
 
 	if oldVersion != version {
 		logger.Infof(ctx, "Database migrated from version %d to %d", oldVersion, version)
 	} else {
 		logger.Infof(ctx, "Database is up to date (version: %d)", version)
-	}
-
-	if dirty {
-		logger.Warnf(ctx, "Database is in dirty state! Manual intervention may be required.")
 	}
 
 	return nil

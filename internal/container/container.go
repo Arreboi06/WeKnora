@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -162,6 +163,9 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(repository.NewSessionRepository))
 	must(container.Provide(repository.NewMessageRepository))
 	must(container.Provide(repository.NewCitationProfileRepository))
+	must(container.Provide(repository.NewCitationProfileOutboxRepository))
+	must(container.Provide(repository.NewCitationProfileACLRepository))
+	must(container.Provide(repository.NewCitationProfileACLAuthority))
 	must(container.Provide(repository.NewMessageSuggestionRepository))
 	must(container.Provide(repository.NewModelRepository))
 	must(container.Provide(repository.NewUserRepository))
@@ -183,7 +187,9 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(service.NewWebSearchStateService))
 	must(container.Provide(repository.NewDataSourceRepository))
 	must(container.Provide(repository.NewSyncLogRepository))
-	must(container.Provide(repository.NewWikiPageRepository))
+	must(container.Provide(func(db *gorm.DB, citationConfig *types.CitationProfileConfig) interfaces.WikiPageRepository {
+		return repository.NewWikiPageRepository(db, citationConfig)
+	}))
 	must(container.Provide(repository.NewMemoryRepository))
 	must(container.Provide(repository.NewTaskPendingOpsRepository))
 	must(container.Provide(repository.NewTaskDeadLetterRepository))
@@ -247,6 +253,8 @@ func BuildContainer(container *dig.Container) *dig.Container {
 
 	must(container.Provide(service.NewMessageService))
 	must(container.Provide(service.NewCitationProfileService))
+	must(container.Provide(service.NewCitationProfileOutboxRunner))
+	must(container.Provide(service.NewCitationProfileACLRefreshRunner))
 	must(container.Provide(service.NewMessageSuggestionService))
 	must(container.Provide(service.NewMCPServiceService))
 	must(container.Provide(service.NewMCPToolApprovalService))
@@ -367,6 +375,13 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	logger.Debugf(ctx, "[Container] Data source sync framework registered")
 	must(container.Invoke(startAuditLogRetention))
 	logger.Debugf(ctx, "[Container] Audit log retention runner registered")
+	must(container.Invoke(startCitationProfileACLRefresh))
+	logger.Debugf(ctx, "[Container] Citation profile ACL refresh runner registered")
+	// ACL startup fencing is a synchronous fail-closed barrier. Only after it
+	// succeeds may durable evidence work begin claiming events from a prior
+	// process lifetime.
+	must(container.Invoke(startCitationProfileOutbox))
+	logger.Debugf(ctx, "[Container] Citation profile outbox runner registered")
 	must(container.Provide(service.NewHousekeepingService))
 	must(container.Invoke(startHousekeepingService))
 	logger.Debugf(ctx, "[Container] Knowledge housekeeping runner registered")
@@ -648,40 +663,21 @@ func initDatabase(cfg *config.Config) (*gorm.DB, error) {
 	var sqliteDBPath string
 	switch os.Getenv("DB_DRIVER") {
 	case "postgres":
-		// DSN for GORM (key-value format)
-		gormDSN := fmt.Sprintf(
-			"host=%s port=%s user=%s password=%s dbname=%s sslmode=%s TimeZone=UTC",
-			os.Getenv("DB_HOST"),
-			os.Getenv("DB_PORT"),
-			os.Getenv("DB_USER"),
-			os.Getenv("DB_PASSWORD"),
-			os.Getenv("DB_NAME"),
-			"disable",
-		)
-		dialector = postgres.Open(gormDSN)
-
-		// DSN for golang-migrate (URL format)
-		// URL-encode password to handle special characters like !@#
-		dbPassword := os.Getenv("DB_PASSWORD")
-		encodedPassword := url.QueryEscape(dbPassword)
-
 		// Check if postgres is in RETRIEVE_DRIVER to determine skip_embedding
 		retrieveDriver := strings.Split(os.Getenv("RETRIEVE_DRIVER"), ",")
-		skipEmbedding := "true"
+		skipEmbedding := true
 		if slices.Contains(retrieveDriver, "postgres") {
-			skipEmbedding = "false"
+			skipEmbedding = false
 		}
-		logger.Infof(context.Background(), "Skip embedding: %s", skipEmbedding)
+		logger.Infof(context.Background(), "Skip embedding: %t", skipEmbedding)
 
-		migrateDSN = fmt.Sprintf(
-			"postgres://%s:%s@%s:%s/%s?sslmode=disable&options=-c%%20app.skip_embedding=%s",
-			os.Getenv("DB_USER"),
-			encodedPassword, // Use encoded password
-			os.Getenv("DB_HOST"),
-			os.Getenv("DB_PORT"),
-			os.Getenv("DB_NAME"),
-			skipEmbedding,
+		gormDSN, migrationDSN := buildPostgresDSNs(
+			os.Getenv("DB_HOST"), os.Getenv("DB_PORT"),
+			os.Getenv("DB_USER"), os.Getenv("DB_PASSWORD"),
+			os.Getenv("DB_NAME"), skipEmbedding,
 		)
+		dialector = postgres.Open(gormDSN)
+		migrateDSN = migrationDSN
 
 		// Debug log (don't log password)
 		logger.Infof(context.Background(), "DB Config: user=%s host=%s port=%s dbname=%s",
@@ -755,12 +751,15 @@ func initDatabase(cfg *config.Config) (*gorm.DB, error) {
 		// Run base migrations (all versioned migrations including embeddings)
 		// The embeddings migration will be conditionally executed based on skip_embedding parameter in DSN
 		if err := database.RunMigrationsWithOptions(migrateDSN, migrationOpts); err != nil {
-			// Log warning but don't fail startup - migrations might be handled externally
-			logger.Warnf(context.Background(), "Database migration failed: %v", err)
-			logger.Warnf(
-				context.Background(),
-				"Continuing with application startup. Please run migrations manually if needed.",
-			)
+			// A process serving an un-migrated or dirty schema is unsafe: handlers
+			// may read/write an incompatible database and silently corrupt state.
+			// Fail the dependency constructor so the application cannot start until
+			// an operator repairs the migration state explicitly.
+			logger.Errorf(context.Background(), "Database migration failed; refusing to start: %v", err)
+			if sqlDB, dbErr := db.DB(); dbErr == nil {
+				_ = sqlDB.Close()
+			}
+			return nil, fmt.Errorf("database migration failed; startup aborted: %w", err)
 		}
 
 		// Post-migration: resolve __pending_env__ storage provider markers for historical KBs.
@@ -795,6 +794,40 @@ func initDatabase(cfg *config.Config) (*gorm.DB, error) {
 	sqlDB.SetConnMaxLifetime(time.Duration(10) * time.Minute)
 
 	return db, nil
+}
+
+// buildPostgresDSNs derives both application and migration DSNs from one URL
+// authority. In particular, url.User omits the password delimiter for trust
+// authentication: a key-value DSN containing "password= dbname=..." lets pgx
+// consume dbname as the empty password's value and silently connects GORM to
+// the default database while golang-migrate connects to the requested one.
+// URL userinfo also applies the correct escaping rules for reserved password
+// characters instead of query-string escaping them.
+func buildPostgresDSNs(host, port, user, password, database string, skipEmbedding bool) (string, string) {
+	userinfo := url.User(user)
+	if password != "" {
+		userinfo = url.UserPassword(user, password)
+	}
+	base := url.URL{
+		Scheme: "postgres",
+		User:   userinfo,
+		Host:   net.JoinHostPort(strings.Trim(host, "[]"), port),
+		Path:   "/" + database,
+	}
+
+	gormURL := base
+	gormQuery := url.Values{}
+	gormQuery.Set("sslmode", "disable")
+	gormQuery.Set("TimeZone", "UTC")
+	gormURL.RawQuery = gormQuery.Encode()
+
+	migrationURL := base
+	migrationQuery := url.Values{}
+	migrationQuery.Set("sslmode", "disable")
+	migrationQuery.Set("options", fmt.Sprintf("-c app.skip_embedding=%t", skipEmbedding))
+	migrationURL.RawQuery = migrationQuery.Encode()
+
+	return gormURL.String(), migrationURL.String()
 }
 
 // resolveStorageProviderPending replaces the "__pending_env__" sentinel in
@@ -1803,4 +1836,36 @@ func startAuditLogRetention(
 		runner.Stop()
 		return nil
 	})
+}
+
+// startCitationProfileOutbox starts durable Topic 4 resolution recovery and
+// registers its shutdown hook. The runner itself is default-off with the
+// feature flag, so the same wiring is safe in every deployment mode.
+func startCitationProfileOutbox(
+	runner *service.CitationProfileOutboxRunner, cleaner interfaces.ResourceCleaner,
+) {
+	if runner == nil {
+		return
+	}
+	runner.Start(context.Background())
+	cleaner.RegisterWithName("CitationProfileOutboxRunner", func() error {
+		runner.Stop()
+		return nil
+	})
+}
+
+func startCitationProfileACLRefresh(
+	runner *service.CitationProfileACLRefreshRunner, cleaner interfaces.ResourceCleaner,
+) error {
+	if runner == nil {
+		return nil
+	}
+	if err := runner.Start(context.Background()); err != nil {
+		return err
+	}
+	cleaner.RegisterWithName("CitationProfileACLRefreshRunner", func() error {
+		runner.Stop()
+		return nil
+	})
+	return nil
 }

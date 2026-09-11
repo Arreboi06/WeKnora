@@ -273,10 +273,34 @@ make fmt && make lint && make test
 
 ### 6.3 数据库与迁移调试
 
-- `AUTO_MIGRATE=false` 可关闭启动时自动迁移；`AUTO_RECOVER_DIRTY`（默认开启，设为 `false` 关闭）控制 dirty state 自动恢复（`internal/container/container.go`）。迁移失败只告警不阻断启动，注意看启动日志里的 `Database migration failed`。
+- `AUTO_MIGRATE=false` 可关闭启动时自动迁移；`AUTO_RECOVER_DIRTY`（默认开启，设为 `false` 关闭）控制 dirty state 自动恢复（`internal/container/container.go`）。迁移失败或迁移结束后仍为 dirty 会返回错误并阻止应用启动；先根据 `Database migration failed` 日志修复数据库，再重新启动。
 - `make migrate-version` 快速确认 schema 版本。
 
-### 6.4 LLM 链路观测（Langfuse）
+### 6.4 Citation profile 首次启用的强制两阶段发布
+
+`WEKNORA_CITATION_PROFILE_ENABLED` 默认为 `false`。首次把带权威 ACL 同步的
+citation profile 投入多副本环境时，必须按下面的顺序发布；这不是可选优化：
+
+1. 保持所有节点的开关为 `false`，完成数据库迁移，并把新 binary 部署到全部节点。
+2. 从负载均衡器摘除并排空全部 pre-F7 旧 binary；确认它们不再处理请求、后台任务或权限写入。
+3. 确认 `citation_profile_acl_runtime_state` 中存在唯一的 `id = 1` 行，且应用启动日志没有迁移或 ACL transition 错误。
+4. 只在上述条件全部满足后，统一把新 fleet 的开关切换为 `true` 并滚动重启。
+5. 启用后验证 marker 的 `enabled = true`，并确认现存 scope 已转为
+   `acl_check_state = 'unknown'`、旧 outbox lease 已清除/暂停，再恢复完整流量。
+
+新 binary 之间即使本地开关短暂不一致，也会通过数据库 runtime marker 的
+SHARE/UPDATE 锁协议串行化权限写和首次启用 fence。marker 一旦变为
+`enabled = true` 就保持单调：本地开关为 `false` 的新节点不会启动画像 runner 或
+开放画像 API，但其权限写路径仍会失效 scope/outbox，不能把全局 marker 清零。
+
+pre-F7 binary 不认识该 marker，所以绝不能让它与已启用的新节点混跑：它可能接受
+权限撤销却不失效旧的 `CURRENT` ACL 结果。若第 2 或第 3 步无法证明完成，发布必须
+保持开关关闭。首次启用后回滚只能回到仍包含 F7 marker/invalidation 协议的新 binary；
+不得用单节点本地开关推断整个 fleet 已停用，也不得回滚到 pre-F7 binary。未来若需要
+彻底退役该安全 marker，必须另行执行显式的全节点排空与运维迁移。不得通过修改
+`AUTO_RECOVER_DIRTY`、跳过迁移或手工伪造 marker 状态来绕过此流程。
+
+### 6.5 LLM 链路观测（Langfuse）
 
 `dev.sh start` 默认拉起自建 Langfuse（`http://localhost:3000`）。本地 `go run` 的 app 需要导出：
 
@@ -288,10 +312,10 @@ export LANGFUSE_SECRET_KEY=sk-lf-xxx
 
 即可在 Langfuse UI 中查看每次会话的模型调用 trace（文档处理 span 亦落库到 `knowledge_processing_spans` 表，前端可视化）。
 
-### 6.5 pprof
+### 6.6 pprof
 
 当前代码中**未内置** `net/http/pprof` 端点（`internal/`、`cmd/` 下无 pprof 引用）。如需性能剖析，可临时在 `cmd/server/main.go` 中 `import _ "net/http/pprof"` 并起一个独立 `http.ListenAndServe("localhost:6060", nil)`，或使用 `go test -bench . -cpuprofile` 针对具体包剖析。
 
-### 6.6 分块策略诊断
+### 6.7 分块策略诊断
 
 chunker 提供 `SplitWithDiagnostics()`（`internal/infrastructure/chunker/strategy.go`），返回策略链选择、各 tier 被拒原因与文档画像，配合 `LOG_LEVEL=debug`（`chunker: tier %s rejected` 日志）可排查分块效果问题。

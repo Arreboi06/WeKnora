@@ -182,8 +182,14 @@ type AgentShareService interface {
 	SetSharedAgentDisabledByMe(ctx context.Context, tenantID uint64, agentID string, sourceTenantID uint64, disabled bool) error
 	// GetSharedAgentForTenant returns the shared agent by agentID if the caller's tenant has access; used to resolve KB scope for @ mention.
 	GetSharedAgentForTenant(ctx context.Context, tenantID uint64, callerTenantRole types.TenantRole, agentID string, sourceTenantID ...uint64) (*types.CustomAgent, error)
-	// TenantCanAccessKBViaSomeSharedAgent returns true if the caller's tenant has at least one shared agent that can access the given KB (for opening KB detail from "通过智能体可见" list without passing agent_id).
+	// TenantCanAccessKBViaSomeSharedAgent preserves the boolean authorization
+	// contract used by read-only handlers. Durable ACL callers must use
+	// ResolveSharedAgentForKB so they can bind the exact authorizing grant.
 	TenantCanAccessKBViaSomeSharedAgent(ctx context.Context, tenantID uint64, callerTenantRole types.TenantRole, kb *types.KnowledgeBase) (bool, error)
+	// ResolveSharedAgentForKB returns the concrete live shared agent whose grant
+	// authorizes the KB. The identity is required for durable ACL binding and
+	// invalidation; an existential boolean is not an auditable authorization proof.
+	ResolveSharedAgentForKB(ctx context.Context, tenantID uint64, callerTenantRole types.TenantRole, kb *types.KnowledgeBase) (*types.CustomAgent, error)
 	GetShare(ctx context.Context, shareID string) (*types.AgentShare, error)
 	GetShareByAgentAndOrg(ctx context.Context, agentID string, orgID string) (*types.AgentShare, error)
 	// GetShareByAgentIDForTenant returns one share for the given agentID that the tenant can access, excluding source_tenant_id == excludeTenantID (e.g. caller's own tenant to get shared-from-other only).

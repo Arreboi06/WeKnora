@@ -33,8 +33,9 @@ type authSession struct {
 	// APIKeyScope marks machine principals; the APIKeyGate authorizes them
 	// per-route from this scope.
 	APIKeyScope *types.TenantAPIKeyScope
-	// AuthIssuedAt records the verified web access token iat for recent-auth guards.
-	AuthIssuedAt *time.Time
+	// AuthTime records the last verified password/IdP authentication. Token
+	// refresh and tenant switching preserve it instead of renewing the grant.
+	AuthTime *time.Time
 	// Extra carries surface-specific context values (e.g. the authenticated
 	// embed channel) that must be visible on both surfaces like the rest.
 	Extra map[types.ContextKey]any
@@ -76,8 +77,8 @@ func applyAuthSession(c *gin.Context, s authSession) {
 	if s.APIKeyScope != nil {
 		ctx = types.WithTenantAPIKeyScope(ctx, *s.APIKeyScope)
 	}
-	if s.AuthIssuedAt != nil && !s.AuthIssuedAt.IsZero() {
-		set(types.AuthIssuedAtContextKey, s.AuthIssuedAt.UTC())
+	if s.AuthTime != nil && !s.AuthTime.IsZero() {
+		set(types.AuthTimeContextKey, s.AuthTime.UTC())
 	}
 	for key, v := range s.Extra {
 		set(key, v)

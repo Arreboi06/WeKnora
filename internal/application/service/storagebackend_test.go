@@ -47,7 +47,7 @@ func TestResolveFileServiceUsesWorkspaceDefaultForStubTenant(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate(&types.Tenant{}, &types.StorageBackend{}))
 
-	tenantRepo := repository.NewTenantRepository(db)
+	tenantRepo := repository.NewTenantRepository(db, nil)
 	storageRepo := repository.NewStorageBackendRepository(db)
 	tenant, err := service.NewTenantService(tenantRepo, storageRepo).CreateTenant(
 		context.Background(), &types.Tenant{Name: "workspace"})

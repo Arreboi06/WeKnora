@@ -95,15 +95,17 @@ func (s *citationProfileService) GetStatus(ctx context.Context, kbID string) (*t
 
 	status.Enrolled = true
 	status.Deleted = scope.Deleted()
-	status.Suspended = scope.Suspended()
-	status.Scope = scope.DTO()
-	status.Snapshot = citationProfileSnapshotFromScope(scope)
-	if status.Suspended && strings.TrimSpace(scope.ACLCheckState) != "" && scope.ACLCheckState != "current" {
+	if !scope.ACLCurrent {
+		status.Suspended = true
 		status.EmptyState = types.CitationProfileEmptyState{
 			Kind:        types.CitationProfileEmptyACLUnknown,
 			MessageCode: types.CitationProfileMessageACLUnknown,
 		}
+		return status, nil
 	}
+	status.Suspended = false
+	status.Scope = scope.DTO()
+	status.Snapshot = citationProfileSnapshotFromScope(scope)
 	return status, nil
 }
 
@@ -139,15 +141,23 @@ func (s *citationProfileService) SetEnrollment(
 		return &types.CitationProfileEnrollmentResponse{
 			Enabled:  false,
 			Enrolled: false,
-			Snapshot: citationProfileZeroSnapshot(),
 		}, nil
 	}
-	return &types.CitationProfileEnrollmentResponse{
+	response := &types.CitationProfileEnrollmentResponse{
 		Enabled:  scope.Enabled,
 		Enrolled: !scope.Deleted(),
-		Scope:    scope.DTO(),
-		Snapshot: citationProfileSnapshotFromScope(scope),
-	}, nil
+	}
+	// Enrollment is a control-plane operation. A newly enrolled scope and any
+	// binding refresh deliberately enter UNKNOWN until the authoritative ACL
+	// worker revalidates them. Never expose epoch/read-version/cutoff/watermark
+	// data from that fail-closed interval (including a concurrent revoke that a
+	// repository implementation returns as non-CURRENT).
+	if scope.ACLCheckState != types.CitationProfileACLStateCurrent {
+		return response, nil
+	}
+	response.Scope = scope.DTO()
+	response.Snapshot = citationProfileSnapshotFromScope(scope)
+	return response, nil
 }
 
 func (s *citationProfileService) CreateExport(
@@ -229,7 +239,7 @@ func (s *citationProfileService) DownloadExport(ctx context.Context, kbID string
 	if err != nil {
 		return nil, err
 	}
-	if citationProfileOperationExpired(op) || op.Status != types.CitationProfileOperationStatusReady || len(op.ResultSummary) == 0 {
+	if op.Status != types.CitationProfileOperationStatusReady || len(op.ResultSummary) == 0 {
 		return nil, types.ErrCitationProfileNotFound
 	}
 	return append([]byte(nil), op.ResultSummary...), nil
@@ -240,12 +250,6 @@ func (s *citationProfileService) RequestCurrentACLDelete(
 	kbID string,
 	req types.CitationProfileDeleteRequest,
 ) (*types.CitationProfileDeleteResponse, error) {
-	if !s.config.Enabled {
-		if _, _, _, err := citationProfileScopeInput(ctx, kbID); err != nil {
-			return nil, err
-		}
-		return citationProfileSyntheticDelete(types.CitationOperationDeleteCurrentACL, types.CitationProfileReceiptHiddenPurgeScheduled), nil
-	}
 	if s.repo == nil {
 		return nil, types.ErrCitationProfileUnavailable
 	}
@@ -266,19 +270,13 @@ func (s *citationProfileService) RequestCurrentACLDelete(
 	if err != nil {
 		return nil, err
 	}
-	return citationProfileDeleteResponse(op, types.CitationProfileReceiptHiddenPurgeScheduled), nil
+	return citationProfileDeleteResponse(op, types.CitationProfileReceiptHiddenAndFenced), nil
 }
 
 func (s *citationProfileService) RequestBlindDelete(
 	ctx context.Context,
 	kbID string,
 ) (*types.CitationProfileDeleteResponse, error) {
-	if !s.config.Enabled {
-		if _, _, _, err := citationProfileScopeInput(ctx, kbID); err != nil {
-			return nil, err
-		}
-		return citationProfileSyntheticDelete(types.CitationOperationDeleteBlind, types.CitationProfileReceiptAccepted), nil
-	}
 	if s.repo == nil {
 		return nil, types.ErrCitationProfileUnavailable
 	}
@@ -351,9 +349,13 @@ func citationProfileSnapshotFromScope(scope *types.CitationProfileScope) *types.
 		return nil
 	}
 	watermark := strings.TrimSpace(scope.SourceUniverseWatermark)
+	eventCutoff, correctionCutoff, activeRunPointerCutoff := types.CitationProfileScopeSnapshotCutoffs(scope)
 	return &types.CitationProfileSnapshot{
 		SubjectEpoch:                 scope.SubjectEpoch,
 		ReadVersion:                  strconv.FormatUint(scope.ProfileReadVersion, 10),
+		EventCutoff:                  eventCutoff,
+		CorrectionCutoff:             correctionCutoff,
+		ActiveRunPointerCutoff:       activeRunPointerCutoff,
 		MappingRevision:              strconv.FormatUint(scope.MappingRevision, 10),
 		SourceUniverseWatermark:      watermark,
 		CurrentIndexWatermark:        watermark,
@@ -378,9 +380,6 @@ func citationProfileExportResponse(kbID string, op *types.CitationProfileOperati
 		return nil
 	}
 	status := op.Status
-	if citationProfileOperationExpired(op) && (status == types.CitationProfileOperationStatusReady || status == types.CitationProfileOperationStatusPreparing) {
-		status = types.CitationProfileOperationStatusExpired
-	}
 	var expiresAt string
 	if op.ExpiresAt != nil && !op.ExpiresAt.IsZero() {
 		expiresAt = op.ExpiresAt.UTC().Format(time.RFC3339Nano)
@@ -415,10 +414,6 @@ func citationProfileOperationSnapshot(op *types.CitationProfileOperation) *types
 		ReadVersion:  "0",
 		CapturedAt:   time.Now().UTC().Format(time.RFC3339Nano),
 	}
-}
-
-func citationProfileOperationExpired(op *types.CitationProfileOperation) bool {
-	return op != nil && op.ExpiresAt != nil && !op.ExpiresAt.IsZero() && time.Now().UTC().After(op.ExpiresAt.UTC())
 }
 
 func citationProfileDeleteResponse(op *types.CitationProfileOperation, receipt string) *types.CitationProfileDeleteResponse {

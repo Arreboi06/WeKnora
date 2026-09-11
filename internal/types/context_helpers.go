@@ -27,6 +27,28 @@ func TenantIDFromContext(ctx context.Context) (uint64, bool) {
 	return v, ok
 }
 
+// WithAuthenticatedTenantID records the tenant whose credentials were
+// verified before a shared-resource guard changes the effective tenant.
+func WithAuthenticatedTenantID(ctx context.Context, tenantID uint64) context.Context {
+	if ctx == nil || tenantID == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, AuthenticatedTenantIDContextKey, tenantID)
+}
+
+// AuthenticatedTenantIDFromContext returns the original authenticated tenant.
+// Requests that never crossed a shared-resource boundary fall back to the
+// effective tenant, where both identities are the same.
+func AuthenticatedTenantIDFromContext(ctx context.Context) (uint64, bool) {
+	if ctx == nil {
+		return 0, false
+	}
+	if tenantID, ok := ctx.Value(AuthenticatedTenantIDContextKey).(uint64); ok && tenantID != 0 {
+		return tenantID, true
+	}
+	return TenantIDFromContext(ctx)
+}
+
 // MustTenantIDFromContext extracts the tenant ID from ctx, panicking if missing.
 func MustTenantIDFromContext(ctx context.Context) uint64 {
 	v, ok := TenantIDFromContext(ctx)

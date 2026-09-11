@@ -269,7 +269,7 @@ func (s *userService) Login(ctx context.Context, req *types.LoginRequest) (*type
 	// but tell the client they're in their home tenant.
 	logger.Info(ctx, "Generating tokens")
 	resolvedTenantID := s.resolveLoginTenantID(ctx, user)
-	accessToken, refreshToken, err := s.generateTokensForTenant(ctx, user, resolvedTenantID)
+	accessToken, refreshToken, err := s.generateTokensForTenant(ctx, user, resolvedTenantID, time.Now().UTC())
 	if err != nil {
 		logger.Errorf(ctx, "Failed to generate tokens: %v", err)
 		return &types.LoginResponse{
@@ -530,7 +530,7 @@ func (s *userService) LoginWithOIDC(
 	// Resolve target tenant once so the JWT claim and the tenant we
 	// return below stay in sync; see Login for the rationale.
 	resolvedTenantID := s.resolveLoginTenantID(ctx, user)
-	accessToken, refreshToken, err := s.generateTokensForTenant(ctx, user, resolvedTenantID)
+	accessToken, refreshToken, err := s.generateTokensForTenant(ctx, user, resolvedTenantID, time.Now().UTC())
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate local tokens: %w", err)
 	}
@@ -848,7 +848,7 @@ func (s *userService) GenerateTokens(
 	ctx context.Context,
 	user *types.User,
 ) (accessToken, refreshToken string, err error) {
-	return s.generateTokensForTenant(ctx, user, s.resolveLoginTenantID(ctx, user))
+	return s.generateTokensForTenant(ctx, user, s.resolveLoginTenantID(ctx, user), time.Now().UTC())
 }
 
 // resolveLoginTenantID picks the tenant whose ID should be encoded in a
@@ -1036,15 +1036,20 @@ func (s *userService) generateTokensForTenant(
 	ctx context.Context,
 	user *types.User,
 	activeTenantID uint64,
+	authTime time.Time,
 ) (accessToken, refreshToken string, err error) {
+	issuedAt := time.Now().UTC()
 	// Generate access token (expires in 24 hours)
 	accessClaims := jwt.MapClaims{
 		"user_id":   user.ID,
 		"email":     user.Email,
 		"tenant_id": activeTenantID,
-		"exp":       time.Now().Add(24 * time.Hour).Unix(),
-		"iat":       time.Now().Unix(),
+		"exp":       issuedAt.Add(24 * time.Hour).Unix(),
+		"iat":       issuedAt.Unix(),
 		"type":      "access",
+	}
+	if !authTime.IsZero() {
+		accessClaims["auth_time"] = authTime.UTC().Unix()
 	}
 
 	accessTokenObj := jwt.NewWithClaims(jwt.SigningMethodHS256, accessClaims)
@@ -1056,9 +1061,12 @@ func (s *userService) generateTokensForTenant(
 	// Generate refresh token (expires in 7 days)
 	refreshClaims := jwt.MapClaims{
 		"user_id": user.ID,
-		"exp":     time.Now().Add(7 * 24 * time.Hour).Unix(),
-		"iat":     time.Now().Unix(),
+		"exp":     issuedAt.Add(7 * 24 * time.Hour).Unix(),
+		"iat":     issuedAt.Unix(),
 		"type":    "refresh",
+	}
+	if !authTime.IsZero() {
+		refreshClaims["auth_time"] = authTime.UTC().Unix()
 	}
 
 	refreshTokenObj := jwt.NewWithClaims(jwt.SigningMethodHS256, refreshClaims)
@@ -1151,7 +1159,8 @@ func (s *userService) SwitchTenant(
 		return nil, fmt.Errorf("record last-active-tenant preference: %w", err)
 	}
 
-	accessToken, refreshToken, err := s.generateTokensForTenant(ctx, user, targetTenantID)
+	authTime, _ := types.AuthTimeFromContext(ctx)
+	accessToken, refreshToken, err := s.generateTokensForTenant(ctx, user, targetTenantID, authTime)
 	if err != nil {
 		return nil, fmt.Errorf("generate tokens: %w", err)
 	}
@@ -1257,6 +1266,28 @@ func isRefreshTokenClaims(claims jwt.MapClaims) bool {
 	return ok && tokenType == "refresh"
 }
 
+func numericDateClaim(claims jwt.MapClaims, name string) (time.Time, bool) {
+	raw, ok := claims[name]
+	if !ok {
+		return time.Time{}, false
+	}
+	var unix int64
+	switch value := raw.(type) {
+	case float64:
+		unix = int64(value)
+	case int64:
+		unix = value
+	case int:
+		unix = int64(value)
+	default:
+		return time.Time{}, false
+	}
+	if unix <= 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(unix, 0).UTC(), true
+}
+
 func userIDFromSignedToken(tokenString string) (string, error) {
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
@@ -1360,8 +1391,12 @@ func (s *userService) RefreshToken(
 	tokenRecord.IsRevoked = true
 	_ = s.tokenRepo.UpdateToken(ctx, tokenRecord)
 
-	// Generate new tokens
-	return s.GenerateTokens(ctx, user)
+	// Rotate the token pair without turning refresh into a new authentication
+	// ceremony. Legacy refresh tokens without auth_time continue to rotate for
+	// ordinary session continuity, but the resulting access token deliberately
+	// lacks a recent-auth grant until the user signs in again.
+	authTime, _ := numericDateClaim(claims, "auth_time")
+	return s.generateTokensForTenant(ctx, user, s.resolveLoginTenantID(ctx, user), authTime)
 }
 
 // Logout invalidates every outstanding session for the user identified by

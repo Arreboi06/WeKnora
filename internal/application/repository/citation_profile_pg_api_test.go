@@ -53,10 +53,8 @@ func TestCitationProfileHTTPPostgresVertical(t *testing.T) {
 	}, http.StatusOK)
 	require.True(t, enrollment.Enabled)
 	require.True(t, enrollment.Enrolled)
-	require.NotNil(t, enrollment.Scope)
-	require.NotEmpty(t, enrollment.Scope.SubjectEpoch)
-	initialEpoch := enrollment.Scope.SubjectEpoch
-	require.Equal(t, "1", enrollment.Snapshot.ReadVersion)
+	require.Nil(t, enrollment.Scope)
+	require.Nil(t, enrollment.Snapshot)
 
 	otherRouter := newCitationProfilePGAPIRouter(repo, tenantID, "subject-http-other")
 	otherStatus := citationProfilePGAPIJSON[types.CitationProfileStatus](t, otherRouter, http.MethodGet, "/kb/"+kbID+"/status", nil, http.StatusOK)
@@ -66,6 +64,8 @@ func TestCitationProfileHTTPPostgresVertical(t *testing.T) {
 	scope, err := repo.GetScopeStatus(ctx, tenantID, subjectID, kbID)
 	require.NoError(t, err)
 	require.NotNil(t, scope)
+	initialEpoch := scope.SubjectEpoch
+	citationProfilePGAPIAuthorizeScope(t, db, scope)
 
 	now := time.Date(2026, 9, 3, 9, 0, 0, 0, time.UTC)
 	pageA := uuid.NewString()
@@ -128,6 +128,8 @@ func TestCitationProfileHTTPPostgresVertical(t *testing.T) {
 	replayedReject := citationProfilePGAPIJSON[types.CitationProfileCorrectionResponse](t, router, http.MethodPost, "/kb/"+kbID+"/corrections", rejectRequest, http.StatusOK)
 	require.Equal(t, reject.CorrectionID, replayedReject.CorrectionID)
 	require.Equal(t, reject.Snapshot.ReadVersion, replayedReject.Snapshot.ReadVersion)
+	require.Equal(t, reject, replayedReject,
+		"an exact idempotent replay must preserve every response field, including snapshot capture time")
 
 	nodesAfterReject := citationProfilePGAPIJSON[types.CitationProfileNodeListResponse](t, router, http.MethodGet, "/kb/"+kbID+"/nodes?page_size=10", nil, http.StatusOK)
 	nodeB = citationProfilePGAPIFindNode(t, nodesAfterReject.Items, pageB)
@@ -199,11 +201,13 @@ func TestCitationProfileHTTPPostgresVertical(t *testing.T) {
 		IdempotencyKey:      uuid.NewString(),
 	}, http.StatusOK)
 	require.True(t, enrollmentB.Enrolled)
-	require.NotNil(t, enrollmentB.Scope)
-	require.NotEqual(t, initialEpoch, enrollmentB.Scope.SubjectEpoch)
+	require.Nil(t, enrollmentB.Scope)
+	require.Nil(t, enrollmentB.Snapshot)
 	scopeB, err := repo.GetScopeStatus(ctx, tenantID, subjectID, kbBID)
 	require.NoError(t, err)
 	require.NotNil(t, scopeB)
+	require.NotEqual(t, initialEpoch, scopeB.SubjectEpoch)
+	citationProfilePGAPIAuthorizeScope(t, db, scopeB)
 	pageBSource := uuid.NewString()
 	pageBTarget := uuid.NewString()
 	knowledgeBID := uuid.NewString()
@@ -243,12 +247,23 @@ func TestCitationProfileHTTPPostgresVertical(t *testing.T) {
 	require.Equal(t, types.EvidenceRelationUnknown, nodeB.Overlay)
 
 	status = citationProfilePGAPIJSON[types.CitationProfileStatus](t, router, http.MethodGet, "/kb/"+kbID+"/status", nil, http.StatusOK)
-	deleteResp := citationProfilePGAPIJSON[types.CitationProfileDeleteResponse](t, router, http.MethodDelete, "/kb/"+kbID, types.CitationProfileDeleteRequest{
+	// A deployment may turn the presentation feature off while a subject's
+	// deletion right is exercised. The off-state service must still durably
+	// fence the real scope; turning the feature back on must reveal only the
+	// redacted tombstone, never the pre-delete evidence snapshot.
+	featureOffRouter := newCitationProfilePGAPIRouterWithConfig(
+		repo, tenantID, subjectID, &types.CitationProfileConfig{Enabled: false},
+	)
+	deleteResp := citationProfilePGAPIJSON[types.CitationProfileDeleteResponse](t, featureOffRouter, http.MethodDelete, "/kb/"+kbID, types.CitationProfileDeleteRequest{
 		ExpectedReadVersion: status.Snapshot.ReadVersion,
 		IdempotencyKey:      uuid.NewString(),
 	}, http.StatusAccepted)
 	require.Equal(t, types.CitationProfileOperationStatusAccepted, deleteResp.Status)
-	require.Equal(t, types.CitationProfileReceiptHiddenPurgeScheduled, deleteResp.ReceiptCode)
+	require.Equal(t, types.CitationProfileReceiptHiddenAndFenced, deleteResp.ReceiptCode)
+	offStatus := citationProfilePGAPIJSON[types.CitationProfileStatus](t, featureOffRouter, http.MethodGet, "/kb/"+kbID+"/status", nil, http.StatusOK)
+	require.False(t, offStatus.Enabled)
+	require.False(t, offStatus.Enrolled)
+	require.False(t, offStatus.Deleted, "feature-off status must not disclose the retained tombstone")
 	deletedStatus := citationProfilePGAPIJSON[types.CitationProfileStatus](t, router, http.MethodGet, "/kb/"+kbID+"/status", nil, http.StatusOK)
 	require.True(t, deletedStatus.Deleted)
 	require.True(t, deletedStatus.Suspended)
@@ -260,6 +275,16 @@ func TestCitationProfileHTTPPostgresVertical(t *testing.T) {
 	var revokedExport types.CitationProfileOperation
 	require.NoError(t, db.Where("id = ?", exportOp.OperationID).First(&revokedExport).Error)
 	require.Equal(t, types.CitationProfileOperationStatusRevoked, revokedExport.Status)
+	var retainedEvents, retainedLinks, retainedCorrections int64
+	require.NoError(t, db.Model(&types.CitationProfileEvent{}).
+		Where("scope_id = ?", scope.ID).Count(&retainedEvents).Error)
+	require.NoError(t, db.Model(&types.EvidenceNodeLink{}).
+		Where("scope_id = ?", scope.ID).Count(&retainedLinks).Error)
+	require.NoError(t, db.Model(&types.CitationProfileCorrection{}).
+		Where("scope_id = ?", scope.ID).Count(&retainedCorrections).Error)
+	require.Positive(t, retainedEvents, "delete must retain the fenced evidence audit trail")
+	require.Positive(t, retainedLinks, "delete must retain the fenced resolution audit trail")
+	require.Positive(t, retainedCorrections, "delete must retain the fenced correction audit trail")
 
 	citationProfilePGAPIRaw(t, router, http.MethodGet, "/kb/"+kbID+"/nodes?page_size=10", nil, http.StatusGone)
 	citationProfilePGAPIRaw(t, router, http.MethodGet, "/kb/"+kbID+"/graph", nil, http.StatusGone)
@@ -284,9 +309,12 @@ func TestCitationProfileHTTPPostgresVertical(t *testing.T) {
 		IdempotencyKey:      uuid.NewString(),
 	}, http.StatusOK)
 	require.True(t, reenrollment.Enrolled)
-	require.NotNil(t, reenrollment.Scope)
-	require.NotEqual(t, initialEpoch, reenrollment.Scope.SubjectEpoch)
-	require.Equal(t, "1", reenrollment.Snapshot.ReadVersion)
+	require.Nil(t, reenrollment.Scope)
+	require.Nil(t, reenrollment.Snapshot)
+	reenrolledScope, err := repo.GetScopeStatus(ctx, tenantID, subjectID, kbID)
+	require.NoError(t, err)
+	require.NotEqual(t, initialEpoch, reenrolledScope.SubjectEpoch)
+	citationProfilePGAPIAuthorizeScope(t, db, reenrolledScope)
 	cleanNodes := citationProfilePGAPIJSON[types.CitationProfileNodeListResponse](t, router, http.MethodGet, "/kb/"+kbID+"/nodes?page_size=10", nil, http.StatusOK)
 	nodeB = citationProfilePGAPIFindNode(t, cleanNodes.Items, pageB)
 	require.Equal(t, 0, nodeB.AuthorizedEvidenceCount)
@@ -296,8 +324,18 @@ func TestCitationProfileHTTPPostgresVertical(t *testing.T) {
 }
 
 func newCitationProfilePGAPIRouter(repo interfaces.CitationProfileRepository, tenantID uint64, subjectID string) *gin.Engine {
+	return newCitationProfilePGAPIRouterWithConfig(
+		repo, tenantID, subjectID, &types.CitationProfileConfig{Enabled: true},
+	)
+}
+
+func newCitationProfilePGAPIRouterWithConfig(
+	repo interfaces.CitationProfileRepository,
+	tenantID uint64,
+	subjectID string,
+	cfg *types.CitationProfileConfig,
+) *gin.Engine {
 	gin.SetMode(gin.TestMode)
-	cfg := &types.CitationProfileConfig{Enabled: true}
 	h := handler.NewCitationProfileHandler(profileservice.NewCitationProfileService(cfg, repo))
 	r := gin.New()
 	r.Use(middleware.ErrorHandler())
@@ -305,6 +343,14 @@ func newCitationProfilePGAPIRouter(repo interfaces.CitationProfileRepository, te
 		ctx := c.Request.Context()
 		ctx = context.WithValue(ctx, types.TenantIDContextKey, tenantID)
 		ctx = context.WithValue(ctx, types.UserIDContextKey, subjectID)
+		ctx = types.WithAuthenticatedTenantID(ctx, tenantID)
+		ctx = types.WithPrincipal(ctx, types.Principal{Type: types.PrincipalWebUser, ID: subjectID})
+		ctx = types.WithCitationProfileACLBinding(ctx, types.CitationProfileACLBinding{
+			PrincipalType:         types.PrincipalWebUser,
+			PrincipalID:           subjectID,
+			AuthenticatedTenantID: tenantID,
+			AccessPath:            types.CitationProfileACLAccessPathOwner,
+		})
 		c.Request = c.Request.WithContext(ctx)
 		c.Next()
 	})
@@ -318,6 +364,29 @@ func newCitationProfilePGAPIRouter(repo interfaces.CitationProfileRepository, te
 	r.GET("/kb/:kb_id/exports/:operation_id/download", h.DownloadExport)
 	r.DELETE("/kb/:kb_id", h.DeleteCurrentScope)
 	return r
+}
+
+func citationProfilePGAPIAuthorizeScope(t *testing.T, db *gorm.DB, scope *types.CitationProfileScope) {
+	t.Helper()
+	require.NotNil(t, scope)
+	require.Equal(t, types.CitationProfileACLStateUnknown, scope.ACLCheckState)
+	authorizedAt := time.Now().UTC().Truncate(time.Microsecond)
+	nextACLCheckAt := authorizedAt.Add(time.Hour)
+	result := db.Model(&types.CitationProfileScope{}).
+		Where("id = ? AND acl_check_state = ?", scope.ID, types.CitationProfileACLStateUnknown).
+		Updates(map[string]interface{}{
+			"acl_check_state":      types.CitationProfileACLStateCurrent,
+			"acl_checked_at":       authorizedAt,
+			"next_acl_check_at":    nextACLCheckAt,
+			"profile_read_version": scope.ProfileReadVersion + 1,
+			"updated_at":           authorizedAt,
+		})
+	require.NoError(t, result.Error)
+	require.Equal(t, int64(1), result.RowsAffected)
+	scope.ACLCheckState = types.CitationProfileACLStateCurrent
+	scope.ACLCheckedAt = &authorizedAt
+	scope.NextACLCheckAt = &nextACLCheckAt
+	scope.ProfileReadVersion++
 }
 
 func citationProfilePGAPIJSON[T any](t *testing.T, router *gin.Engine, method, path string, body any, wantStatus int) T {
@@ -368,7 +437,45 @@ func ensureCitationProfilePGAPISchema(db *gorm.DB) error {
 			return err
 		}
 	}
+	migrationPath := filepath.Join("..", "..", "..", "migrations", "versioned", "000092_citation_profile_event_identity.up.sql")
+	migrationSQL, err := os.ReadFile(migrationPath)
+	if err != nil {
+		return err
+	}
+	if err := db.Exec(string(migrationSQL)).Error; err != nil {
+		return err
+	}
+	migrationPath = filepath.Join("..", "..", "..", "migrations", "versioned", "000093_citation_profile_outbox_due_index.up.sql")
+	migrationSQL, err = os.ReadFile(migrationPath)
+	if err != nil {
+		return err
+	}
+	if err := db.Exec(string(migrationSQL)).Error; err != nil {
+		return err
+	}
+	if err := ensureCitationProfilePGAPIACLSchema(db); err != nil {
+		return err
+	}
 	return createCitationProfilePGAPIWikiPagesTable(db)
+}
+
+func ensureCitationProfilePGAPIACLSchema(db *gorm.DB) error {
+	var ready bool
+	query := "SELECT " +
+		"EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'citation_profile_scopes' AND column_name = 'acl_generation') " +
+		"AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'citation_profile_event_outbox' AND column_name = 'retry_budget_paused_at') " +
+		"AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'citation_profile_event_outbox' AND column_name = 'lease_until')"
+	if err := db.Raw(query).Scan(&ready).Error; err != nil {
+		return err
+	}
+	if ready {
+		return nil
+	}
+	migrationSQL, err := os.ReadFile(filepath.Join("..", "..", "..", "migrations", "versioned", "000094_citation_profile_acl_sync.up.sql"))
+	if err != nil {
+		return err
+	}
+	return db.Exec(string(migrationSQL)).Error
 }
 
 func citationProfilePGAPISchemaExists(db *gorm.DB) (bool, error) {

@@ -1,5 +1,9 @@
 import { post, get, put } from '@/utils/request'
 import i18n from '@/i18n'
+import { userInfoFromApi, type UserInfo } from '../../utils/userInfo'
+
+export { userInfoFromApi }
+export type { UserInfo }
 
 const t = (key: string) => i18n.global.t(key)
 
@@ -103,20 +107,6 @@ export interface UserPreferences {
   oidc_only_login?: boolean
 }
 
-// 用户信息接口
-export interface UserInfo {
-  id: string
-  username: string
-  email: string
-  avatar?: string
-  tenant_id: string
-  can_access_all_tenants?: boolean
-  preferences?: UserPreferences
-  is_system_admin?: boolean
-  created_at: string
-  updated_at: string
-}
-
 /**
  * 把后端返回的 user JSON 规范化成前端 UserInfo。
  *
@@ -135,29 +125,6 @@ export interface UserInfo {
  * 类型（后端某天传 1/0 或字符串）做严格收敛，避免把 truthy 字符串
  * 误判为权限通过。
  */
-export function userInfoFromApi(
-  u: any,
-  fallbackTenantId?: string | number | null,
-): UserInfo {
-  const rawTenantId =
-    u?.tenant_id !== undefined && u?.tenant_id !== null && u.tenant_id !== ''
-      ? u.tenant_id
-      : fallbackTenantId ?? ''
-  const tid = Number(rawTenantId) > 0 ? rawTenantId : ''
-  return {
-    id: u?.id || '',
-    username: u?.username || '',
-    email: u?.email || '',
-    avatar: u?.avatar,
-    tenant_id: String(tid) || '',
-    can_access_all_tenants: u?.can_access_all_tenants === true,
-    is_system_admin: u?.is_system_admin === true,
-    preferences: u?.preferences,
-    created_at: u?.created_at || new Date().toISOString(),
-    updated_at: u?.updated_at || new Date().toISOString(),
-  }
-}
-
 // 空间信息接口
 export interface TenantInfo {
   id: string

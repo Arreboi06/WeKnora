@@ -2,9 +2,68 @@ import type {
   CitationProfileGraphResponse,
   CitationProfileNode,
   CitationProfileReadVersion,
+  CitationProfileStatusResponse,
 } from '../../../../api/wiki/citationProfile'
 
 export type CitationProfileNodeCard = Pick<CitationProfileNode, 'page_uuid' | 'title' | 'slug' | 'overlay'>
+export type CitationProfilePanelState = 'deleted' | 'feature_disabled' | 'acl_unknown' | 'not_enrolled' | 'ready'
+
+export interface CitationProfileRequestToken {
+  readonly generation: number
+  readonly knowledgeBaseId: string
+  readonly lane: string
+  readonly sequence: number
+}
+
+/**
+ * Fences asynchronous panel work by both KB generation and request lane.
+ * Navigating or refreshing advances the generation; starting newer work in one
+ * lane supersedes only that lane, so status, graph, and node fan-out may still
+ * complete independently without allowing an older response to overwrite it.
+ */
+export class CitationProfileRequestFence {
+  private generation = 0
+  private knowledgeBaseId = ''
+  private readonly laneSequences = new Map<string, number>()
+
+  reset(knowledgeBaseId: string): number {
+    this.generation += 1
+    this.knowledgeBaseId = knowledgeBaseId
+    this.laneSequences.clear()
+    return this.generation
+  }
+
+  begin(lane: string): CitationProfileRequestToken {
+    const sequence = (this.laneSequences.get(lane) || 0) + 1
+    this.laneSequences.set(lane, sequence)
+    return {
+      generation: this.generation,
+      knowledgeBaseId: this.knowledgeBaseId,
+      lane,
+      sequence,
+    }
+  }
+
+  isCurrent(token: CitationProfileRequestToken, knowledgeBaseId: string): boolean {
+    return token.generation === this.generation
+      && token.knowledgeBaseId === this.knowledgeBaseId
+      && token.knowledgeBaseId === knowledgeBaseId
+      && this.laneSequences.get(token.lane) === token.sequence
+  }
+}
+
+export function citationProfilePanelState(
+  status: Pick<CitationProfileStatusResponse, 'deleted' | 'enrolled' | 'suspended' | 'empty_state'>,
+): CitationProfilePanelState {
+  // A deleted scope is deliberately returned as a redacted 200 tombstone so
+  // the owner can see the deletion receipt and re-enroll. It must win over
+  // acl_unknown, which is also present because deleted scopes are fenced.
+  if (status.deleted) return 'deleted'
+  if (status.empty_state?.kind === 'feature_disabled') return 'feature_disabled'
+  if (status.empty_state?.kind === 'acl_unknown' || status.suspended) return 'acl_unknown'
+  if (!status.enrolled) return 'not_enrolled'
+  return 'ready'
+}
 
 export function citationProfileNodeKey(node: Pick<CitationProfileNode, 'page_uuid'>): string {
   return node.page_uuid

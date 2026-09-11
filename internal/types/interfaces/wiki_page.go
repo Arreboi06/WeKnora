@@ -258,6 +258,16 @@ type WikiPageRepository interface {
 	// unchanged body, and status-only transitions.
 	UpdateMeta(ctx context.Context, page *types.WikiPage) error
 
+	// UpdateInLink atomically adds or removes one source slug from a target
+	// page's reverse-link set. It updates no other page or Citation Profile
+	// state, so concurrent bookkeeping cannot overwrite unrelated fields.
+	UpdateInLink(ctx context.Context, tenantID uint64, kbID string, targetSlug string, sourceSlug string, present bool) error
+
+	// RebuildInLinks replaces every reverse-link set in one knowledge base
+	// from the authoritative current out_links projection. It mutates no page
+	// revision, updated_at token, or Citation Profile state.
+	RebuildInLinks(ctx context.Context, tenantID uint64, kbID string) error
+
 	// UpdateAutoLinkedContent rewrites `content`, `out_links` and
 	// `updated_at` in place while leaving `version` untouched. Intended for
 	// machine-only link markup changes (cross-link injection / dead-link

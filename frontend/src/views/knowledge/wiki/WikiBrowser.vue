@@ -6540,6 +6540,36 @@ onUnmounted(() => {
   align-items: center;
 }
 
+// The citation profile is the third browser column on desktop. On a narrow
+// viewport it must become a real vertical section rather than sitting beyond
+// the right edge of the fixed-height Wiki browser.
+@media (max-width: 900px) {
+  .wiki-browser {
+    flex-direction: column;
+    overflow-y: auto;
+  }
+
+  .wiki-sidebar {
+    flex: 0 0 auto;
+    width: 100%;
+    min-width: 0;
+    max-height: 42vh;
+    border-right: 0;
+    border-bottom: 1px solid var(--td-component-stroke);
+  }
+
+  .wiki-content {
+    flex: 0 0 auto;
+    min-height: 50vh;
+    overflow: visible;
+  }
+
+  .wiki-reader {
+    overflow: visible;
+    padding-inline: 16px;
+  }
+}
+
 .wiki-issue-popup-action {
   font-size: 12px;
   color: var(--td-brand-color);

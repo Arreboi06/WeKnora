@@ -98,24 +98,28 @@ func (s *stubKBShareForGuard) CountByOrganizations(context.Context, []string) (m
 
 // stubAgentShareForGuard implements just the two methods the guard
 // touches: GetSharedAgentForTenant (when ?agent_id=X is supplied) and
-// TenantCanAccessKBViaSomeSharedAgent (the any-shared-agent fallback).
+// ResolveSharedAgentForKB (the any-shared-agent fallback).
 // Every other method panics so unintended new dependencies surface
 // immediately.
 type stubAgentShareForGuard struct {
 	// agents indexed by agent id; nil entry means GetSharedAgentForTenant
 	// returns nil + nil (i.e. caller has no access to that agent id).
 	agents map[string]*types.CustomAgent
-	// kbsViaSomeAgent[kb.ID] -> true means the any-agent fallback grants
-	// access to that KB.
-	kbsViaSomeAgent map[string]bool
+	// agentsByKB[kb.ID] is the concrete proof selected by the any-agent fallback.
+	agentsByKB map[string]*types.CustomAgent
 }
 
 func (s *stubAgentShareForGuard) GetSharedAgentForTenant(_ context.Context, _ uint64, _ types.TenantRole, agentID string, _ ...uint64) (*types.CustomAgent, error) {
 	return s.agents[agentID], nil
 }
 
-func (s *stubAgentShareForGuard) TenantCanAccessKBViaSomeSharedAgent(_ context.Context, _ uint64, _ types.TenantRole, kb *types.KnowledgeBase) (bool, error) {
-	return s.kbsViaSomeAgent[kb.ID], nil
+func (s *stubAgentShareForGuard) ResolveSharedAgentForKB(_ context.Context, _ uint64, _ types.TenantRole, kb *types.KnowledgeBase) (*types.CustomAgent, error) {
+	return s.agentsByKB[kb.ID], nil
+}
+
+func (s *stubAgentShareForGuard) TenantCanAccessKBViaSomeSharedAgent(ctx context.Context, tenantID uint64, callerTenantRole types.TenantRole, kb *types.KnowledgeBase) (bool, error) {
+	agent, err := s.ResolveSharedAgentForKB(ctx, tenantID, callerTenantRole, kb)
+	return agent != nil, err
 }
 
 func (s *stubAgentShareForGuard) ShareAgent(context.Context, string, string, string, uint64, types.OrgMemberRole) (*types.AgentShare, error) {
@@ -333,7 +337,7 @@ func TestRequireKBAccess_AgentShare_AnyAgent_ViewerOnly(t *testing.T) {
 	// access this KB. Required permission is Viewer, so the agent-share
 	// branch activates and grants read access at the source tenant.
 	agent := &stubAgentShareForGuard{
-		kbsViaSomeAgent: map[string]bool{"kb-shared": true},
+		agentsByKB: map[string]*types.CustomAgent{"kb-shared": {ID: "agent-any", TenantID: 200}},
 	}
 	_, c := runGuard(t, 100, "kb-shared",
 		types.OrgRoleViewer,
@@ -346,6 +350,7 @@ func TestRequireKBAccess_AgentShare_AnyAgent_ViewerOnly(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, uint64(200), access.EffectiveTenantID)
 	require.Equal(t, types.OrgRoleViewer, access.Permission, "agent share grants viewer only")
+	require.Equal(t, "agent-any", access.AccessID, "the grant must carry a concrete revocable agent identity")
 }
 
 func TestRequireKBAccess_AgentShare_EditorRequired_Aborts(t *testing.T) {
@@ -354,7 +359,7 @@ func TestRequireKBAccess_AgentShare_EditorRequired_Aborts(t *testing.T) {
 	// PR: old TagHandler.effectiveCtxForKB granted any agent-share
 	// access to write routes, which leaked tag CRUD.
 	agent := &stubAgentShareForGuard{
-		kbsViaSomeAgent: map[string]bool{"kb-shared": true},
+		agentsByKB: map[string]*types.CustomAgent{"kb-shared": {ID: "agent-any", TenantID: 200}},
 	}
 	_, c := runGuard(t, 100, "kb-shared",
 		types.OrgRoleEditor,
@@ -429,7 +434,7 @@ func TestRequireKBAccess_AgentShare_SpecificAgent_ModeSelected_Miss(t *testing.T
 			},
 		},
 		// any-agent fallback would have said yes — but agent_id=A pins us.
-		kbsViaSomeAgent: map[string]bool{"kb-shared": true},
+		agentsByKB: map[string]*types.CustomAgent{"kb-shared": {ID: "agent-B", TenantID: 200}},
 	}
 	_, c := runGuard(t, 100, "kb-shared",
 		types.OrgRoleViewer,

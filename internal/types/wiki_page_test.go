@@ -2,6 +2,7 @@ package types
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 )
 
@@ -84,6 +85,16 @@ func TestStringArrayValueScan(t *testing.T) {
 
 	if len(restored) != 3 || restored[0] != "a" || restored[1] != "b" || restored[2] != "c" {
 		t.Errorf("StringArray round-trip failed: got %v", restored)
+	}
+}
+
+func TestStringArrayScanAcceptsDriverText(t *testing.T) {
+	var restored StringArray
+	if err := restored.Scan(`["doc/a","doc/b"]`); err != nil {
+		t.Fatalf("StringArray.Scan(string) error: %v", err)
+	}
+	if !reflect.DeepEqual(restored, StringArray{"doc/a", "doc/b"}) {
+		t.Fatalf("StringArray.Scan(string) = %#v", restored)
 	}
 }
 
