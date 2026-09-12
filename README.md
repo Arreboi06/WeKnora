@@ -114,6 +114,8 @@ The framework supports auto-syncing knowledge from Feishu, GitLab, Tencent IMA, 
 
 Fully modular pipeline from document parsing, vectorization, and retrieval to LLM inference — every component is swappable and extensible. Supports local / private cloud deployment with full data sovereignty and a zero-barrier Web UI for quick onboarding.
 
+> Rhino Bird 2026 Topic 2 final integration status: [auditable local result and submission blockers](./docs/rhino-bird-2026-topic2-final-status.md). The record is RED and does not claim official acceptance.
+
 ## 🧩 Feature Overview
 
 **Intelligent Conversation**
