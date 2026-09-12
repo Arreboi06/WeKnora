@@ -1,0 +1,15 @@
+version: 1
+student:
+  name: "万阳烨墁"
+  github_id: "Arreboi06"
+topic:
+  id: "2"
+  title: "可视化沙箱工作台"
+result:
+  type: code
+  url: "https://github.com/Arreboi06/WeKnora/tree/rhino-2026-final-T2"
+repository:
+  url: "https://github.com/Arreboi06/WeKnora.git"
+  branch: "codex/rhino-2026-topic2-midterm-56d3086"
+  commit: "dfa561a526975e4294ef5528db8e14af52fc39c8"
+  tag: "rhino-2026-final-T2"
