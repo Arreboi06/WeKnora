@@ -1,0 +1,15 @@
+version: 1
+student:
+  name: "REPLACE_WITH_REAL_NAME_BEFORE_EMAIL"
+  github_id: "Arreboi06"
+topic:
+  id: "T4"
+  title: "知识网络与引导式学习"
+result:
+  type: "code"
+  url: "https://github.com/Arreboi06/WeKnora/tree/rhino-2026-final-T4"
+repository:
+  url: "https://github.com/Arreboi06/WeKnora"
+  branch: "codex/rhino-2026-topic4-midterm-56d3086"
+  commit: "0bbb4853cb4bab38e1e947a1ec6b9d0178b40794"
+  tag: "rhino-2026-final-T4"
