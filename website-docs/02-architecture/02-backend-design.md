@@ -98,7 +98,7 @@ if redisAvailable {
 
 - `ResourceCleaner`（`internal/container/cleanup.go`）：各组件通过 `RegisterWithName(name, cleanupFunc)` 注册析构（ants 池、Langfuse flush、数据源调度器、Housekeeping 等），退出时统一 `Cleanup(ctx)`；
 - `EngineFactory`（`internal/container/engine_factory.go`）：根据 `vector_stores` 表行运行时创建检索引擎实例（`createQdrantEngine` / `createMilvusEngine` / `createDorisEngine` / `createOpenSearchEngine` ...），而非启动期静态绑定单一引擎；
-- `initDatabase` 除建连外还负责：golang-migrate 自动迁移（`AUTO_MIGRATE`，失败仅告警不阻断）、`__pending_env__` 存储 provider 回填、遗留 StorageBackend 迁移、序列同步、Lite 模式 pending 任务复位、`config/builtin_models.yaml` 声明式内置模型 UPSERT；SQLite 时强制 `SetMaxOpenConns(1)` 串行化写入。
+- `initDatabase` 除建连外还负责：golang-migrate 自动迁移（`AUTO_MIGRATE`；迁移失败或恢复后仍为 dirty 时返回错误并阻断应用启动）、`__pending_env__` 存储 provider 回填、遗留 StorageBackend 迁移、序列同步、Lite 模式 pending 任务复位、`config/builtin_models.yaml` 声明式内置模型 UPSERT；SQLite 时强制 `SetMaxOpenConns(1)` 串行化写入。
 
 ## 3. cmd/server 启动流程
 

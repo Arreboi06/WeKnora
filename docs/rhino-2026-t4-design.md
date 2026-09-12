@@ -32,4 +32,3 @@ The submitted implementation snapshot is pinned at [`rhino-2026-final-T4`](https
 ## Follow-up plan
 
 The next confidence step is measurement, not a semantic change: collect two independent human annotation sheets for the Topic 4 effectiveness cases and adjudicate disagreements. A second environment with the required external Go module payloads should also repeat the CGO=0 container path. These follow-ups are kept separate from the submitted behaviour so that the reported result remains reproducible and auditable.
-
