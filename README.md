@@ -109,6 +109,14 @@ The framework supports auto-syncing knowledge from Feishu, Notion, and Yuque (mo
 
 Fully modular pipeline from document parsing, vectorization, and retrieval to LLM inference — every component is swappable and extensible. Supports local / private cloud deployment with full data sovereignty and a zero-barrier Web UI for quick onboarding.
 
+## 🎓 Rhino-bird 2026 · Topic 4 delivery note
+
+The Topic 4 implementation focuses on a verifiable **Wiki source evidence profile**: every generated knowledge view remains traceable to the complete source universe that produced it. The design makes the important failure modes explicit—source changes invalidate the whole dependent projection, stale concurrent work cannot be published, failed migrations fail closed before the app serves traffic, multi-scope locks have a deterministic order, ACL state is synchronised from an authoritative marker, and SQLite/PostgreSQL index semantics are checked for parity.
+
+The implementation and verification entry points are collected in [`docs/rhino-2026-t4-design.md`](./docs/rhino-2026-t4-design.md). The verification path includes real PostgreSQL concurrency/API checks, restart and isolated backup/restore, a real application + database + browser walkthrough, Go/vet and frontend checks, and secret scanning. The submitted implementation snapshot is pinned to [`rhino-2026-final-T4`](https://github.com/Arreboi06/WeKnora/tree/rhino-2026-final-T4) at commit `0bbb4853cb4bab38e1e947a1ec6b9d0178b40794`.
+
+Follow-up work is intentionally measurable: obtain two independent human annotation sheets and an adjudication for effectiveness, then repeat the container CGO=0 path in an environment with the required external module payloads. These follow-ups do not change the submitted behaviour or its source-of-truth invariants.
+
 ## 🧩 Feature Overview
 
 **Intelligent Conversation**
